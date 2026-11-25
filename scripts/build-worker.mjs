@@ -76,7 +76,9 @@ if (!forceCpu && triple.includes("apple")) {
     const m = /^v(\d+)\.(\d+)$/.exec(basename(cuda));
     if (m) env[`CUDA_PATH_V${m[1]}_${m[2]}`] = cuda;
     env.CMAKE_CUDA_ARCHITECTURES ??= "native";
-    env.PATH = `${join(cuda, "bin")}${process.platform === "win32" ? ";" : ":"}${env.PATH}`;
+    // On Windows the variable is usually spelled "Path"; a copied env object is case-sensitive.
+    const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    env[pathKey] = `${join(cuda, "bin")}${process.platform === "win32" ? ";" : ":"}${env[pathKey] ?? ""}`;
   }
 }
 console.log(`earshot-worker: building with ${features.length ? features.join(", ") : "CPU only"}`);
