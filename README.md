@@ -23,8 +23,8 @@ cargo test --workspace # Rust tests
 
 ## Releases and updates
 
-Installed copies update themselves from
-[earshot-releases](https://github.com/distractiondigital/earshot-releases). To ship a version:
+Installed copies update themselves from this repository's GitHub releases (signed `latest.json`).
+To ship a version:
 
 ```sh
 npm run release -- 0.2.0   # bumps versions, commits, tags v0.2.0

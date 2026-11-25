@@ -1,11 +1,11 @@
 name: Release
 
 # Builds signed installers for a version tag and publishes them, with the updater manifest
-# (latest.json), to the public releases repository that the in-app updater reads from.
+# (latest.json), as a GitHub release of this repository. Installed copies read
+# releases/latest/download/latest.json, so updates only reach users once the repository is public.
 #
-# Required repository secrets:
+# Required repository secret:
 #   TAURI_SIGNING_PRIVATE_KEY  updater signing key (`tauri signer generate`)
-#   RELEASES_TOKEN             fine-grained token with Contents: read & write on the releases repo
 
 on:
   push:
@@ -13,11 +13,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-env:
-  RELEASES_OWNER: distractiondigital
-  RELEASES_REPO: earshot-releases
+  contents: write
 
 jobs:
   publish:
@@ -55,12 +51,10 @@ jobs:
 
       - uses: tauri-apps/tauri-action@action-v1.0.0
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
-          owner: ${{ env.RELEASES_OWNER }}
-          repo: ${{ env.RELEASES_REPO }}
           tagName: ${{ github.ref_name }}
           releaseName: Earshot ${{ github.ref_name }}
           releaseBody: See the assets below to download and install this version.

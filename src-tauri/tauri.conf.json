@@ -61,7 +61,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRDOUYzRENFRDdGOThFM0YKUldRL2p2blh6ajJmVERNOENjQzZOcWF5djRMeXhOdU8vbmd4RFJwTE9WbzUzZUE4cU1rMGc1blAK",
       "endpoints": [
-        "https://github.com/distractiondigital/earshot-releases/releases/latest/download/latest.json"
+        "https://github.com/distractiondigital/earshot/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
