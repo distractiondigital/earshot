@@ -1,0 +1,24 @@
+# Planning documents and notes (never committed)
+PLAN.md
+DECISIONS.md
+CLAUDE.md
+_notes/
+.claude/
+
+# Build output
+target/
+node_modules/
+dist/
+
+# Model files
+*.gguf
+*.bin
+*.onnx
+
+# Misc
+.DS_Store
+*.log
+.vscode/*
+!.vscode/extensions.json
+src-tauri/gen/schemas/
+src-tauri/binaries/
