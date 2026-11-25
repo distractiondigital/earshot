@@ -9,11 +9,15 @@
     "typecheck": "tsc -b",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:worker": "node scripts/build-worker.mjs"
+    "build:worker": "node scripts/build-worker.mjs",
+    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@fontsource-variable/geist": "5.3.0",
     "@tauri-apps/api": "2.12.5",
+    "@tauri-apps/plugin-process": "2.4.0",
+    "@tauri-apps/plugin-updater": "2.14.1",
     "class-variance-authority": "0.7.1",
     "cn": "0.5.2",
     "lucide-react": "1.79.0",

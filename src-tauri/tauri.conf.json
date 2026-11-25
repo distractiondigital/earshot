@@ -42,7 +42,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/earshot-worker"],
+    "externalBin": [
+      "binaries/earshot-worker"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -52,6 +54,18 @@
     ],
     "category": "Productivity",
     "shortDescription": "Local meeting recorder and transcriber",
-    "copyright": "MIT License"
+    "copyright": "MIT License",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRDOUYzRENFRDdGOThFM0YKUldRL2p2blh6ajJmVERNOENjQzZOcWF5djRMeXhOdU8vbmd4RFJwTE9WbzUzZUE4cU1rMGc1blAK",
+      "endpoints": [
+        "https://github.com/distractiondigital/earshot-releases/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

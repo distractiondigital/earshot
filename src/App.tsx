@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AudioLines, Settings as SettingsIcon, Users } from "lucide-react";
 import { cn } from "cn";
+import { UpdateBanner } from "@/components/UpdateBanner";
 import { Meetings } from "@/screens/Meetings";
 import { Speakers } from "@/screens/Speakers";
 import { Settings } from "@/screens/Settings";
@@ -37,11 +38,14 @@ export default function App() {
           </button>
         ))}
       </nav>
-      <main className="flex-1 overflow-y-auto">
-        {screen === "meetings" && <Meetings />}
-        {screen === "speakers" && <Speakers />}
-        {screen === "settings" && <Settings />}
-      </main>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <main className="flex-1 overflow-y-auto">
+          {screen === "meetings" && <Meetings />}
+          {screen === "speakers" && <Speakers />}
+          {screen === "settings" && <Settings />}
+        </main>
+        <UpdateBanner />
+      </div>
     </div>
   );
 }

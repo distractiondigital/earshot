@@ -17,10 +17,22 @@ Requirements:
 
 ```sh
 npm ci
-npm run tauri dev      # run the app with hot reload
-npm run tauri build    # build installers into target/release/bundle/
+npm run tauri:dev      # run "Earshot Dev" with hot reload (separate data folder, no updater)
 cargo test --workspace # Rust tests
 ```
+
+## Releases and updates
+
+Installed copies update themselves from
+[earshot-releases](https://github.com/distractiondigital/earshot-releases). To ship a version:
+
+```sh
+npm run release -- 0.2.0   # bumps versions, commits, tags v0.2.0
+git push --follow-tags     # CI builds, signs and publishes installers + latest.json
+```
+
+Building installers locally (`npm run tauri build`) requires the updater signing key in
+`TAURI_SIGNING_PRIVATE_KEY`; pass `--config '{"bundle":{"createUpdaterArtifacts":false}}'` to skip it.
 
 ## Layout
 

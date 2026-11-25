@@ -7,6 +7,7 @@ export interface AppInfo {
   schemaVersion: number;
   dataDir: string;
   workerVersion: string | null;
+  updatesEnabled: boolean;
 }
 
 export const ipc = {

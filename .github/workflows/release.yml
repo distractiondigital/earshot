@@ -1,0 +1,71 @@
+name: Release
+
+# Builds signed installers for a version tag and publishes them, with the updater manifest
+# (latest.json), to the public releases repository that the in-app updater reads from.
+#
+# Required repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY  updater signing key (`tauri signer generate`)
+#   RELEASES_TOKEN             fine-grained token with Contents: read & write on the releases repo
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASES_OWNER: distractiondigital
+  RELEASES_REPO: earshot-releases
+
+jobs:
+  publish:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            args: ""
+          - name: macos-universal
+            os: macos-latest
+            args: --target universal-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Add macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          owner: ${{ env.RELEASES_OWNER }}
+          repo: ${{ env.RELEASES_REPO }}
+          tagName: ${{ github.ref_name }}
+          releaseName: Earshot ${{ github.ref_name }}
+          releaseBody: See the assets below to download and install this version.
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}

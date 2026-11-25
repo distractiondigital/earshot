@@ -1,8 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ipc, type AppInfo, type Theme } from "@/lib/ipc";
 import { useTheme } from "@/lib/theme";
+import { useUpdates } from "@/lib/updates";
 
 export function Settings() {
   return (
@@ -77,6 +80,54 @@ function About() {
           {info.dataDir}
         </span>
       </Row>
+      <Updates />
     </div>
+  );
+}
+
+function Updates() {
+  const { enabled, autoCheck, setAutoCheck, status, checkNow, install } = useUpdates();
+  if (!enabled) {
+    return (
+      <Row label="Updates">
+        <span className="text-sm text-muted-foreground">Disabled in development builds</span>
+      </Row>
+    );
+  }
+  const busy = status.kind === "checking" || status.kind === "downloading" || status.kind === "installing";
+  let message = "";
+  if (status.kind === "checking") message = "Checking…";
+  else if (status.kind === "upToDate") message = "Earshot is up to date.";
+  else if (status.kind === "available") message = `Version ${status.update.version} is available.`;
+  else if (status.kind === "downloading") message = "Downloading…";
+  else if (status.kind === "installing") message = "Installing…";
+  else if (status.kind === "error") message = "Couldn't check for updates.";
+
+  return (
+    <>
+      <Row label="Check for updates automatically">
+        <Switch checked={autoCheck} onCheckedChange={setAutoCheck} aria-label="Check for updates automatically" />
+      </Row>
+      <Row label="Updates">
+        <div className="flex items-center gap-3">
+          <span
+            className="text-sm text-muted-foreground"
+            role="status"
+            title={status.kind === "error" ? status.message : undefined}
+          >
+            {message}
+          </span>
+          {status.kind === "available" ? (
+            <Button size="sm" onClick={install}>
+              Update and restart
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={checkNow} disabled={busy}>
+              Check now
+            </Button>
+          )}
+        </div>
+      </Row>
+    </>
   );
 }
