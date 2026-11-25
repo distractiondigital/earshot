@@ -77,6 +77,7 @@ pub fn run() {
             commands::recordings_dir,
             commands::choose_recordings_dir,
             commands::open_recordings_dir,
+            commands::open_link,
             commands::get_hotkey,
             commands::set_hotkey,
             commands::list_models,

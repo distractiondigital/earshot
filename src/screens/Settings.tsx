@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { SettingsRow } from "@/components/SettingsRow";
+import icon from "@/assets/icon.png";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { aboutNote, credits } from "@/lib/credits";
 import { ipc, type AppInfo, type Theme } from "@/lib/ipc";
 import { useTheme } from "@/lib/theme";
 import { useUpdates } from "@/lib/updates";
@@ -70,21 +73,63 @@ function About() {
   if (!info) return null;
   return (
     <div>
-      <Row label="Version">
-        <span className="text-sm text-muted-foreground">{info.version}</span>
+      <header className="flex items-center gap-4 pb-4">
+        <img src={icon} alt="" className="size-12 rounded-lg" />
+        <div>
+          <h2 className="text-lg font-semibold">Earshot</h2>
+          <p className="text-sm text-muted-foreground">Version {info.version}</p>
+        </div>
+      </header>
+
+      <Updates />
+      <Row label="Transcription engine">
+        <span className="text-sm text-muted-foreground">{info.workerVersion ?? "not available"}</span>
       </Row>
       <Row label="Database schema">
         <span className="text-sm text-muted-foreground">v{info.schemaVersion}</span>
-      </Row>
-      <Row label="Worker">
-        <span className="text-sm text-muted-foreground">{info.workerVersion ?? "not available"}</span>
       </Row>
       <Row label="Data folder">
         <span className="truncate text-sm text-muted-foreground select-text" title={info.dataDir}>
           {info.dataDir}
         </span>
       </Row>
-      <Updates />
+
+      {credits.map((group) => (
+        <section key={group.title} className="mt-8" aria-labelledby={`credits-${group.title}`}>
+          <h3
+            id={`credits-${group.title}`}
+            className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
+          >
+            {group.title}
+          </h3>
+          <ul className="mt-3 space-y-3">
+            {group.items.map((c) => (
+              <li key={c.name} className="text-sm">
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                  <span className="font-medium">{c.name}</span>
+                  <span className="text-muted-foreground">by {c.by}</span>
+                  <Badge variant="outline" className="font-normal">
+                    {c.license}
+                  </Badge>
+                </div>
+                {c.note && <p className="text-muted-foreground">{c.note}</p>}
+                <button
+                  type="button"
+                  onClick={() => ipc.openLink(c.url).catch(() => {})}
+                  className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                >
+                  {c.url.replace(/^https:\/\//, "")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+
+      <p className="mt-8 text-sm text-muted-foreground">{aboutNote}</p>
+      <p className="mt-4 border-t border-border pt-4 text-sm text-muted-foreground">
+        © 2026 Distraction Digital. Free and open source (MIT).
+      </p>
     </div>
   );
 }

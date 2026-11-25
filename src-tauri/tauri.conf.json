@@ -55,7 +55,8 @@
     ],
     "category": "Productivity",
     "shortDescription": "Local meeting recorder and transcriber",
-    "copyright": "MIT License",
+    "copyright": "© 2026 Distraction Digital. MIT License.",
+    "publisher": "Distraction Digital",
     "createUpdaterArtifacts": true
   },
   "plugins": {

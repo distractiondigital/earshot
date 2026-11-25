@@ -359,6 +359,16 @@ pub fn open_recordings_dir(app: AppHandle) -> Result<(), String> {
         .map_err(err)
 }
 
+/// Opens a web page (the About screen's credit links) in the default browser.
+#[tauri::command]
+pub fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    if !url.starts_with("https://") {
+        return Err("Only https links can be opened.".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(err)
+}
+
 #[tauri::command]
 pub fn get_hotkey(app: AppHandle) -> String {
     hotkey::current(&app)

@@ -14,4 +14,5 @@ export const ipc = {
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
   setSetting: (key: string, value: string) => invoke<void>("set_setting", { key, value }),
   appInfo: () => invoke<AppInfo>("app_info"),
+  openLink: (url: string) => invoke<void>("open_link", { url }),
 };
