@@ -11,6 +11,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(include_str!("../migrations/0001_init.sql")),
         M::up(include_str!("../migrations/0002_recording.sql")),
+        M::up(include_str!("../migrations/0003_source_spec.sql")),
     ])
 });
 
@@ -46,6 +47,8 @@ pub struct TrackRow {
     pub duration_ms: i64,
     pub finalized: bool,
     pub source: Option<String>,
+    /// JSON `SystemSource` for the meeting track.
+    pub source_spec: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +126,7 @@ impl Db {
         Ok(c.last_insert_rowid())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_track(
         &self,
         meeting_id: i64,
@@ -131,12 +135,13 @@ impl Db {
         sample_rate: u32,
         channels: u16,
         source: &str,
+        source_spec: Option<&str>,
     ) -> Result<i64, DbError> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO tracks (meeting_id, kind, path, sample_rate, channels, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![meeting_id, kind, path, sample_rate, channels, source],
+            "INSERT INTO tracks (meeting_id, kind, path, sample_rate, channels, source, source_spec)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![meeting_id, kind, path, sample_rate, channels, source, source_spec],
         )?;
         Ok(c.last_insert_rowid())
     }
@@ -240,7 +245,8 @@ impl Db {
     pub fn tracks(&self, meeting_id: i64) -> Result<Vec<TrackRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT id, meeting_id, kind, path, sample_rate, channels, duration_ms, finalized, source
+            "SELECT id, meeting_id, kind, path, sample_rate, channels, duration_ms, finalized, source,
+                    source_spec
              FROM tracks WHERE meeting_id = ?1 ORDER BY kind",
         )?;
         let rows = stmt.query_map([meeting_id], |r| {
@@ -254,6 +260,7 @@ impl Db {
                 duration_ms: r.get(6)?,
                 finalized: r.get::<_, i64>(7)? != 0,
                 source: r.get(8)?,
+                source_spec: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -272,7 +279,7 @@ mod tests {
     #[test]
     fn migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -339,7 +346,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db.create_meeting(1_000, "").unwrap();
         let t = db
-            .add_track(id, "mic", "/x/mic.flac", 48_000, 1, "Mic")
+            .add_track(id, "mic", "/x/mic.flac", 48_000, 1, "Mic", None)
             .unwrap();
         assert_eq!(db.mark_interrupted().unwrap(), 1);
         assert_eq!(

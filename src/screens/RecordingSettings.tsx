@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { ipc } from "@/lib/ipc";
-import { recorder, type InputDevice } from "@/lib/recorder";
+import { parseSavedSource, serializeSource, SourceSelect } from "@/components/SourceSelect";
+import { recorder, type InputDevice, type Sources, type SystemSource } from "@/lib/recorder";
 
 const DEFAULT_DEVICE = "__default__";
 const isMac = navigator.userAgent.includes("Mac");
@@ -13,16 +14,23 @@ const isMac = navigator.userAgent.includes("Mac");
 export function RecordingSettings() {
   const [devices, setDevices] = useState<InputDevice[]>([]);
   const [mic, setMic] = useState(DEFAULT_DEVICE);
-  const [system, setSystem] = useState("all");
+  const [system, setSystem] = useState<SystemSource>({ kind: "all" });
+  const [sources, setSources] = useState<Sources | null>(null);
   const [showPill, setShowPill] = useState(true);
   const [consent, setConsent] = useState(false);
   const [dir, setDir] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    recorder.sources().then((s) => setDevices(s.inputDevices)).catch(() => {});
+    recorder
+      .sources()
+      .then((s) => {
+        setSources(s);
+        setDevices(s.inputDevices);
+      })
+      .catch(() => {});
     ipc.getSetting("recording.micDevice").then((v) => v && setMic(v));
-    ipc.getSetting("recording.systemSource").then((v) => v && setSystem(v));
+    ipc.getSetting("recording.systemSource").then((v) => setSystem(parseSavedSource(v)));
     ipc.getSetting("recording.showPill").then((v) => setShowPill(v !== "false"));
     ipc.getSetting("recording.consentReminder").then((v) => setConsent(v === "true"));
     recorder.recordingsDir().then(setDir);
@@ -58,22 +66,19 @@ export function RecordingSettings() {
         </Select>
       </SettingsRow>
 
-      <SettingsRow label="Meeting audio" hint="Default for the hotkey and tray. Pick a single app when you start recording.">
-        <Select
+      <SettingsRow
+        label="Meeting audio"
+        hint="What the meeting track records by default (hotkey and tray too). You can change it each time you record."
+      >
+        <SourceSelect
           value={system}
-          onValueChange={(v) => {
-            setSystem(v);
-            save("recording.systemSource", v);
+          sources={sources}
+          onOpen={() => recorder.sources().then(setSources).catch(() => {})}
+          onChange={(s) => {
+            setSystem(s);
+            save("recording.systemSource", serializeSource(s));
           }}
-        >
-          <SelectTrigger className="w-64" aria-label="Meeting audio">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All system audio</SelectItem>
-            <SelectItem value="none">Don't record (microphone only)</SelectItem>
-          </SelectContent>
-        </Select>
+        />
       </SettingsRow>
 
       <SettingsRow label="Recordings folder" hint={dir}>

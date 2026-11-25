@@ -41,70 +41,92 @@ pub fn list_input_devices() -> Vec<InputDevice> {
         .collect()
 }
 
-pub fn prepare_mic(device_id_wanted: Option<&str>) -> Result<Prepared, String> {
-    let host = cpal::default_host();
-    let device = match device_id_wanted {
-        Some(want) => host
-            .input_devices()
-            .map_err(|e| e.to_string())?
-            .find(|d| device_id(d).as_deref() == Some(want))
-            // The saved device was unplugged: fall back to the default rather than failing.
-            .or_else(|| host.default_input_device()),
-        None => host.default_input_device(),
-    }
-    .ok_or("No microphone found")?;
-    let config = device
-        .default_input_config()
-        .map_err(|e| format!("Microphone unavailable: {e}"))?;
-    Ok(prepare(device, config))
-}
-
-/// Opens the mic preferring `sample_rate` / `channels` (to continue an existing track file).
-pub fn prepare_mic_like(
+/// Opens an input device. `strict_name = Some(name)` means the device was chosen as the meeting
+/// source: if it is missing, fail (falling back to the default mic would duplicate the mic
+/// track). Otherwise a missing device falls back to the system default.
+/// `like` = (sample rate, channels) is preferred when the device supports it.
+pub fn prepare_input(
     device_id_wanted: Option<&str>,
-    sample_rate: u32,
-    channels: u16,
+    like: Option<(u32, u16)>,
+    strict_name: Option<&str>,
 ) -> Result<Prepared, String> {
     let host = cpal::default_host();
-    let device = device_id_wanted
-        .and_then(|want| {
-            host.input_devices()
-                .ok()?
-                .find(|d| device_id(d).as_deref() == Some(want))
-        })
-        .or_else(|| host.default_input_device())
-        .ok_or("No microphone found")?;
-    let ranges: Vec<_> = device
-        .supported_input_configs()
-        .map(|r| r.collect())
-        .unwrap_or_default();
-    let fits = |r: &cpal::SupportedStreamConfigRange| {
-        r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate()
+    let found = device_id_wanted.and_then(|want| {
+        host.input_devices()
+            .ok()?
+            .find(|d| device_id(d).as_deref() == Some(want))
+    });
+    let device = match (found, strict_name) {
+        (Some(d), _) => d,
+        (None, Some(name)) => return Err(format!("{name} is not connected.")),
+        (None, None) => host.default_input_device().ok_or("No microphone found")?,
     };
-    let config = ranges
-        .iter()
-        .find(|r| r.channels() == channels && fits(r))
-        .or_else(|| ranges.iter().find(|r| fits(r)))
-        .map(|r| r.with_sample_rate(sample_rate));
-    let config = match config {
+    let config = match like.and_then(|(rate, ch)| preferred_config(&device, rate, ch)) {
         Some(c) => c,
         None => device
             .default_input_config()
-            .map_err(|e| format!("Microphone unavailable: {e}"))?,
+            .map_err(|e| format!("{} unavailable: {e}", device_name(&device)))?,
     };
     Ok(prepare(device, config))
 }
 
+fn preferred_config(
+    device: &cpal::Device,
+    sample_rate: u32,
+    channels: u16,
+) -> Option<SupportedStreamConfig> {
+    let ranges: Vec<_> = device.supported_input_configs().ok()?.collect();
+    let fits = |r: &cpal::SupportedStreamConfigRange| {
+        r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate()
+    };
+    ranges
+        .iter()
+        .find(|r| r.channels() == channels && fits(r))
+        .or_else(|| ranges.iter().find(|r| fits(r)))
+        .map(|r| r.with_sample_rate(sample_rate))
+}
+
 #[cfg(not(windows))]
-pub fn prepare_system_loopback() -> Result<Prepared, String> {
+pub fn list_output_devices() -> Vec<InputDevice> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or("No output device found")?;
+    let default_id = host.default_output_device().as_ref().and_then(device_id);
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+    devices
+        .filter_map(|d| {
+            let id = device_id(&d)?;
+            Some(InputDevice {
+                is_default: Some(&id) == default_id.as_ref(),
+                name: device_name(&d),
+                id,
+            })
+        })
+        .collect()
+}
+
+/// Records what an output device plays (macOS 14.6+, via a Core Audio tap). `None` = default.
+#[cfg(not(windows))]
+pub fn prepare_output_loopback(device_id_wanted: Option<&str>) -> Result<Prepared, String> {
+    let host = cpal::default_host();
+    let device = match device_id_wanted {
+        Some(want) => host
+            .output_devices()
+            .map_err(|e| e.to_string())?
+            .find(|d| device_id(d).as_deref() == Some(want))
+            .ok_or("That output device is not connected.")?,
+        None => host
+            .default_output_device()
+            .ok_or("No output device found")?,
+    };
     let config = device
         .default_output_config()
         .map_err(|e| format!("System audio unavailable: {e}"))?;
-    Ok(prepare(device, config))
+    let mut p = prepare(device, config);
+    if device_id_wanted.is_none() {
+        p.label = "All system audio".into();
+    }
+    Ok(p)
 }
 
 fn prepare(device: cpal::Device, config: SupportedStreamConfig) -> Prepared {

@@ -27,7 +27,8 @@ const SETTINGS: &[(&str, Option<&[&str]>)] = &[
     ("theme", Some(&["light", "dark", "system"])),
     ("updates.autoCheck", Some(&["true", "false"])),
     ("recording.micDevice", None),
-    ("recording.systemSource", Some(&["all", "none"])),
+    // "all", "none" or a JSON SystemSource; validated in check_setting.
+    ("recording.systemSource", None),
     ("recording.showPill", Some(&["true", "false"])),
     ("recording.consentReminder", Some(&["true", "false"])),
     ("ui.headphonesTipShown", Some(&["true", "false"])),
@@ -43,6 +44,13 @@ pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String
         .iter()
         .find(|(k, _)| *k == key)
         .ok_or_else(|| format!("unknown setting: {key}"))?;
+    if key == "recording.systemSource"
+        && let Some(v) = value
+        && !matches!(v, "all" | "none")
+        && serde_json::from_str::<capture::SystemSource>(v).is_err()
+    {
+        return Err(format!("invalid meeting audio source: {v}"));
+    }
     match (value, allowed) {
         (Some(v), Some(allowed)) if !allowed.contains(&v) => {
             Err(format!("invalid value for {key}: {v}"))
@@ -141,6 +149,7 @@ pub fn pause_recording(
 #[serde(rename_all = "camelCase")]
 pub struct Sources {
     input_devices: Vec<InputDevice>,
+    output_devices: Vec<InputDevice>,
     apps: Vec<AudioApp>,
     supports_app_capture: bool,
 }
@@ -151,6 +160,7 @@ pub async fn list_sources() -> Result<Sources, String> {
         let supports_app_capture = capture::supports_app_capture();
         Ok(Sources {
             input_devices: capture::list_input_devices(),
+            output_devices: capture::list_output_devices(),
             apps: if supports_app_capture {
                 capture::list_audio_apps()
             } else {
@@ -265,5 +275,14 @@ mod tests {
         assert!(check_setting("recording.dir", None).is_ok());
         assert!(check_setting("recording.dir", Some("C:\\anywhere")).is_err());
         assert!(check_setting("nope", None).is_err());
+        assert!(check_setting("recording.systemSource", Some("all")).is_ok());
+        assert!(
+            check_setting(
+                "recording.systemSource",
+                Some(r#"{"kind":"output","id":"{0.0.0}.{x}","name":"Voice Chat"}"#)
+            )
+            .is_ok()
+        );
+        assert!(check_setting("recording.systemSource", Some("bogus")).is_err());
     }
 }

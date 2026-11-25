@@ -170,15 +170,26 @@ impl Recorder {
             .or_else(|| db.get_setting("recording.micDevice").ok().flatten());
         let system = match opts.system {
             Some(s) => s,
-            None => match db
-                .get_setting("recording.systemSource")
-                .map_err(err)?
-                .as_deref()
-            {
-                Some("none") => SystemSource::None,
-                _ => SystemSource::All,
-            },
+            None => saved_system_source(
+                db.get_setting("recording.systemSource")
+                    .map_err(err)?
+                    .as_deref(),
+            ),
         };
+        if let SystemSource::Input { id, name } = &system {
+            let mic_id = mic_device.clone().filter(|d| !d.is_empty()).or_else(|| {
+                capture::list_input_devices()
+                    .into_iter()
+                    .find(|d| d.is_default)
+                    .map(|d| d.id)
+            });
+            if mic_id.as_deref() == Some(id.as_str()) {
+                return Err(format!(
+                    "{name} is also your microphone. Pick a different meeting audio source or microphone."
+                ));
+            }
+        }
+        let system_spec = serde_json::to_string(&system).ok();
 
         let mut warnings = Vec::new();
         let mut prepared: Vec<(&'static str, Prepared)> = Vec::new();
@@ -204,7 +215,12 @@ impl Recorder {
         let clock = Arc::new(Clock::start());
         let mut tracks = Vec::new();
         for (kind, p) in prepared {
-            match start_track(&db, meeting_id, kind, p, &dir, clock.clone()) {
+            let spec = if kind == "system" {
+                system_spec.as_deref()
+            } else {
+                None
+            };
+            match start_track(&db, meeting_id, kind, p, spec, &dir, clock.clone()) {
                 Ok(t) => tracks.push(t),
                 Err(e) => warnings.push(format!("{kind}: {e}")),
             }
@@ -349,8 +365,16 @@ impl Recorder {
             let prepared = if kind == "mic" {
                 capture::prepare_mic_like(mic_device.as_deref(), w.sample_rate(), w.channels())
             } else {
-                system_source_for(row.source.as_deref(), &mut warnings)
-                    .and_then(|s| capture::prepare_system(&s)?.ok_or_else(|| "no source".into()))
+                let source = row
+                    .source_spec
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<SystemSource>(j).ok())
+                    .map(Ok)
+                    .unwrap_or_else(|| system_source_for(row.source.as_deref(), &mut warnings));
+                source.and_then(|s| {
+                    capture::prepare_system_like(&s, Some((w.sample_rate(), w.channels())))?
+                        .ok_or_else(|| "no source".into())
+                })
             };
             let p = match prepared {
                 Ok(p) if p.format.sample_rate == w.sample_rate() => p,
@@ -439,6 +463,15 @@ impl Recorder {
     }
 }
 
+/// The saved default meeting source: "all" (or unset), "none", or a JSON `SystemSource`.
+pub fn saved_system_source(value: Option<&str>) -> SystemSource {
+    match value {
+        None | Some("") | Some("all") => SystemSource::All,
+        Some("none") => SystemSource::None,
+        Some(json) => serde_json::from_str(json).unwrap_or(SystemSource::All),
+    }
+}
+
 /// Finalizes a reopened track that will not be continued, keeping what was recorded.
 fn close_track(db: &Db, track_id: i64, w: flac::FlacWriter) {
     let rate = u64::from(w.sample_rate().max(1));
@@ -509,11 +542,13 @@ pub fn interrupted(db: &Db) -> Option<Interrupted> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_track(
     db: &Db,
     meeting_id: i64,
     kind: &'static str,
     p: Prepared,
+    spec: Option<&str>,
     dir: &Path,
     clock: Arc<Clock>,
 ) -> Result<LiveTrack, String> {
@@ -532,6 +567,7 @@ fn start_track(
             fmt.sample_rate,
             fmt.channels,
             &label,
+            spec,
         )
         .map_err(err)?;
     let capture = p.start(sink);

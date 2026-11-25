@@ -2,7 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
-export type SystemSource = { kind: "none" } | { kind: "all" } | { kind: "app"; pid: number; name: string };
+export type SystemSource =
+  | { kind: "none" }
+  | { kind: "all" }
+  | { kind: "app"; pid: number; name: string }
+  | { kind: "output"; id: string; name: string }
+  | { kind: "input"; id: string; name: string };
 
 export interface RecorderState {
   status: "idle" | "recording" | "paused";
@@ -36,6 +41,7 @@ export interface AudioApp {
 
 export interface Sources {
   inputDevices: InputDevice[];
+  outputDevices: InputDevice[];
   apps: AudioApp[];
   supportsAppCapture: boolean;
 }

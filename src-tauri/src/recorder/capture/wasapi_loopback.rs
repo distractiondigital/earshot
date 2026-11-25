@@ -1,5 +1,6 @@
 //! Windows meeting-audio capture via WASAPI:
 //! - all system audio: loopback on the default render device;
+//! - one output device: loopback on that render device (e.g. a virtual "Voice Chat" device);
 //! - a single app: process loopback (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Windows 10
 //!   build 20348+), which includes the app's child processes.
 //!
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use wasapi::{Direction, SampleType, SessionState, StreamMode, WaveFormat};
 
-use super::{AudioApp, Format, Prepared};
+use super::{AudioApp, Format, InputDevice, Prepared};
 use crate::recorder::track::SampleSink;
 
 const RATE: u32 = 48_000;
@@ -33,23 +34,42 @@ pub fn supports_process_loopback() -> bool {
     windows_build().is_some_and(|b| b >= PROCESS_LOOPBACK_MIN_BUILD)
 }
 
-pub fn prepare(app: Option<(u32, String)>) -> Result<Prepared, String> {
-    if app.is_some() && !supports_process_loopback() {
+/// Which loopback to open.
+pub enum Target {
+    Default,
+    Device { id: String, name: String },
+    App { pid: u32, name: String },
+}
+
+/// Finds the running process for a saved app: the saved PID if still alive, else an app with an
+/// audio session and the same name.
+pub fn resolve_app(pid: u32, name: &str) -> Result<u32, String> {
+    if process_running(pid) {
+        return Ok(pid);
+    }
+    list_audio_apps()
+        .into_iter()
+        .find(|a| a.name == name)
+        .map(|a| a.pid)
+        .ok_or_else(|| format!("{name} isn't running or hasn't played any audio yet."))
+}
+
+pub fn prepare(target: Target) -> Result<Prepared, String> {
+    if matches!(target, Target::App { .. }) && !supports_process_loopback() {
         return Err("Recording a single app requires Windows 10 build 20348 or newer.".into());
     }
     // Process loopback on an exited PID succeeds but records silence: refuse it up front.
-    if let Some((pid, name)) = &app
+    if let Target::App { pid, name } = &target
         && !process_running(*pid)
     {
         return Err(format!(
             "{name} is no longer running. Pick it again from the list."
         ));
     }
-    let label = match &app {
-        Some((_, name)) => name.clone(),
-        None => "All system audio".into(),
+    let label = match &target {
+        Target::Default => "All system audio".to_owned(),
+        Target::Device { name, .. } | Target::App { name, .. } => name.clone(),
     };
-    let pid = app.map(|(pid, _)| pid);
     Ok(Prepared {
         format: Format {
             sample_rate: RATE,
@@ -60,7 +80,7 @@ pub fn prepare(app: Option<(u32, String)>) -> Result<Prepared, String> {
             std::thread::Builder::new()
                 .name("earshot-capture-wasapi".into())
                 .spawn(move || {
-                    if let Err(e) = run(pid, sink, &stop) {
+                    if let Err(e) = run(&target, sink, &stop) {
                         log::error!("loopback capture failed: {e}");
                         failed.store(true, Ordering::Relaxed);
                     }
@@ -71,7 +91,7 @@ pub fn prepare(app: Option<(u32, String)>) -> Result<Prepared, String> {
 }
 
 fn run(
-    pid: Option<u32>,
+    target: &Target,
     mut sink: SampleSink,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -84,10 +104,16 @@ fn run(
         CHANNELS as usize,
         None,
     );
-    let mut client = match pid {
-        Some(pid) => wasapi::AudioClient::new_application_loopback_client(pid, true)?,
-        None => {
+    let mut client = match target {
+        Target::App { pid, .. } => {
+            wasapi::AudioClient::new_application_loopback_client(*pid, true)?
+        }
+        Target::Default => {
             let device = wasapi::DeviceEnumerator::new()?.get_default_device(Direction::Render)?;
+            device.get_iaudioclient()?
+        }
+        Target::Device { id, .. } => {
+            let device = wasapi::DeviceEnumerator::new()?.get_device(id)?;
             device.get_iaudioclient()?
         }
     };
@@ -188,6 +214,41 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     list
+}
+
+/// Active render devices (for "record what this device plays").
+pub fn list_output_devices() -> Vec<InputDevice> {
+    // Fresh thread: COM must be MTA here (see list_audio_apps).
+    std::thread::spawn(|| -> Result<Vec<InputDevice>, String> {
+        wasapi::initialize_mta().ok().map_err(|e| e.to_string())?;
+        let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| e.to_string())?;
+        let default_id = enumerator
+            .get_default_device(Direction::Render)
+            .and_then(|d| d.get_id())
+            .ok();
+        let mut out = Vec::new();
+        for device in &enumerator
+            .get_device_collection(Direction::Render)
+            .map_err(|e| e.to_string())?
+        {
+            let Ok(device) = device else { continue };
+            let (Ok(id), Ok(name)) = (device.get_id(), device.get_friendlyname()) else {
+                continue;
+            };
+            out.push(InputDevice {
+                is_default: Some(&id) == default_id.as_ref(),
+                id,
+                name,
+            });
+        }
+        Ok(out)
+    })
+    .join()
+    .unwrap_or_else(|_| Err("device listing panicked".into()))
+    .unwrap_or_else(|e| {
+        log::warn!("listing output devices failed: {e}");
+        Vec::new()
+    })
 }
 
 fn process_running(pid: u32) -> bool {

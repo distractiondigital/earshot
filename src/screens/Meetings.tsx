@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { parseSavedSource, SourceSelect } from "@/components/SourceSelect";
 import { ipc } from "@/lib/ipc";
 import {
   formatDuration,
@@ -161,12 +162,10 @@ function InterruptedBanner({
   );
 }
 
-const ALL = "all";
-const NONE = "none";
 
 function RecordControls({ onError, compact }: { onError: (e: string) => void; compact: boolean }) {
   const [sources, setSources] = useState<Sources | null>(null);
-  const [choice, setChoice] = useState<string>(ALL);
+  const [source, setSource] = useState<SystemSource>({ kind: "all" });
   const [starting, setStarting] = useState(false);
 
   const loadSources = useCallback(() => {
@@ -175,20 +174,13 @@ function RecordControls({ onError, compact }: { onError: (e: string) => void; co
 
   useEffect(() => {
     loadSources();
-    ipc.getSetting("recording.systemSource").then((v) => v === NONE && setChoice(NONE));
+    ipc.getSetting("recording.systemSource").then((v) => setSource(parseSavedSource(v)));
   }, [loadSources]);
 
   const start = async () => {
-    let system: SystemSource = { kind: "all" };
-    if (choice === NONE) system = { kind: "none" };
-    else if (choice.startsWith("app:")) {
-      const pid = Number(choice.slice(4));
-      const app = sources?.apps.find((a) => a.pid === pid);
-      if (app) system = { kind: "app", pid, name: app.name };
-    }
     setStarting(true);
     try {
-      await recorder.start({ system });
+      await recorder.start({ system: source });
     } catch (e) {
       onError(String(e));
     } finally {
@@ -204,28 +196,7 @@ function RecordControls({ onError, compact }: { onError: (e: string) => void; co
           <Circle className="fill-current text-red-500" aria-hidden />
           Record
         </Button>
-        <Select value={choice} onValueChange={setChoice} onOpenChange={(o) => o && loadSources()}>
-          <SelectTrigger className="w-56" aria-label="Meeting audio source">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>All system audio</SelectItem>
-            <SelectItem value={NONE}>Microphone only</SelectItem>
-            {sources?.supportsAppCapture && sources.apps.length > 0 && (
-              <>
-                <SelectSeparator />
-                <SelectGroup>
-                  <SelectLabel>Only this app</SelectLabel>
-                  {sources.apps.map((a) => (
-                    <SelectItem key={a.pid} value={`app:${a.pid}`}>
-                      {a.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </>
-            )}
-          </SelectContent>
-        </Select>
+        <SourceSelect value={source} onChange={setSource} sources={sources} onOpen={loadSources} />
       </div>
     </div>
   );
@@ -284,7 +255,7 @@ function HeadphonesTip() {
     <div className="mt-3 flex items-start gap-3 rounded-md bg-muted/60 px-3 py-2 text-sm">
       <Headphones className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
       <p className="flex-1 text-muted-foreground">
-        Tip: wear headphones. On speakers, other people's voices leak into your mic track.
+        Tip: Use headphones to reduce feedback or echo from your speakers.
       </p>
       <button type="button" aria-label="Dismiss tip" onClick={dismiss} className="text-muted-foreground">
         <X className="size-4" />
