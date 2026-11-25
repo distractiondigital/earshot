@@ -37,7 +37,8 @@
         "frame-ancestors": "'none'"
       },
       "freezePrototype": true
-    }
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,

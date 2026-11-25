@@ -128,3 +128,9 @@
     @apply font-sans;
     }
 }
+/* The recorder pill window is transparent; only the rounded pill itself is painted. */
+html.pill,
+html.pill body {
+  background: transparent;
+  overflow: hidden;
+}

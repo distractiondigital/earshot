@@ -2,9 +2,16 @@
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Wry};
+
+use crate::recorder::Recorder;
 
 const MAIN_WINDOW: &str = "main";
+
+/// Menu items whose text changes with the recorder state.
+struct TrayItems {
+    record: MenuItem<Wry>,
+}
 
 pub fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
@@ -14,9 +21,25 @@ pub fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// Updates the Start/Stop item to match the recorder.
+pub fn set_recording(app: &AppHandle, recording: bool) {
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let _ = items.record.set_text(if recording {
+            "Stop Recording"
+        } else {
+            "Start Recording"
+        });
+    }
+}
+
+/// Runs `f` off the main thread (recorder start/stop joins threads and must not block the UI).
+fn in_background(app: &AppHandle, f: impl FnOnce(&AppHandle) + Send + 'static) {
+    let app = app.clone();
+    std::thread::spawn(move || f(&app));
+}
+
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    // Recording is wired up in M1; the item is present but disabled so the menu layout is final.
-    let record = MenuItem::with_id(app, "record", "Start Recording", false, None::<&str>)?;
+    let record = MenuItem::with_id(app, "record", "Start Recording", true, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open Earshot", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Earshot", true, None::<&str>)?;
     let menu = Menu::with_items(
@@ -29,6 +52,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
             &quit,
         ],
     )?;
+    app.manage(TrayItems { record });
 
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Earshot")
@@ -36,7 +60,9 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         // Left click opens the window on Windows; the menu stays on right click.
         .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id().as_ref() {
+            "record" => in_background(app, |app| app.state::<Recorder>().toggle(app)),
             "open" => show_main_window(app),
+            // Exit goes through RunEvent::ExitRequested, which finalizes an active recording.
             "quit" => app.exit(0),
             _ => {}
         })

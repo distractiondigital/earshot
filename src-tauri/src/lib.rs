@@ -1,84 +1,49 @@
+mod commands;
 mod db;
+mod hotkey;
+mod pill;
+mod recorder;
 mod tray;
 mod worker;
 
-use serde::Serialize;
-use tauri::{Manager, State, WindowEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 
 use crate::db::Db;
-
-/// Settings the frontend may read and write, with their allowed values. Anything else is rejected.
-const SETTINGS: &[(&str, &[&str])] = &[
-    ("theme", &["light", "dark", "system"]),
-    ("updates.autoCheck", &["true", "false"]),
-];
-
-fn check_setting(key: &str, value: Option<&str>) -> Result<(), String> {
-    let (_, allowed) = SETTINGS
-        .iter()
-        .find(|(k, _)| *k == key)
-        .ok_or_else(|| format!("unknown setting: {key}"))?;
-    match value {
-        Some(v) if !allowed.contains(&v) => Err(format!("invalid value for {key}: {v}")),
-        _ => Ok(()),
-    }
-}
-
-#[tauri::command]
-fn get_setting(db: State<'_, Db>, key: String) -> Result<Option<String>, String> {
-    check_setting(&key, None)?;
-    db.get_setting(&key).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn set_setting(db: State<'_, Db>, key: String, value: String) -> Result<(), String> {
-    check_setting(&key, Some(&value))?;
-    db.set_setting(&key, &value).map_err(|e| e.to_string())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AppInfo {
-    version: String,
-    schema_version: u32,
-    data_dir: String,
-    worker_version: Option<String>,
-    /// False for dev builds (`tauri.dev.conf.json`), which must never update themselves.
-    updates_enabled: bool,
-}
-
-#[tauri::command]
-async fn app_info(app: tauri::AppHandle, db: State<'_, Db>) -> Result<AppInfo, String> {
-    let worker_version = tauri::async_runtime::spawn_blocking(worker::ping)
-        .await
-        .map_err(|e| e.to_string())?
-        .inspect_err(|e| log::warn!("worker ping failed: {e}"))
-        .ok();
-    Ok(AppInfo {
-        version: app.package_info().version.to_string(),
-        schema_version: db.schema_version().map_err(|e| e.to_string())?,
-        data_dir: app
-            .path()
-            .app_data_dir()
-            .map_err(|e| e.to_string())?
-            .display()
-            .to_string(),
-        worker_version,
-        updates_enabled: !app.config().identifier.ends_with(".dev"),
-    })
-}
+use crate::recorder::Recorder;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // Must be first: a second launch focuses the running instance instead of starting a
+        // second recorder.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }))
+        // Local log files only (app log dir), plus stdout in dev. Never sent anywhere.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(2_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                .build(),
+        )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(hotkey::plugin())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let db = Db::open(&data_dir.join("earshot.db"))?;
+            let interrupted = db.mark_interrupted()?;
+            if interrupted > 0 {
+                log::warn!("{interrupted} recording(s) were interrupted and can be recovered");
+            }
             app.manage(db);
+            app.manage(Recorder::default());
             tray::build(app.handle())?;
+            hotkey::register_saved(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -90,22 +55,36 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_setting, set_setting, app_info])
-        .run(tauri::generate_context!())
-        .expect("error while running Earshot");
-}
+        .invoke_handler(tauri::generate_handler![
+            commands::get_setting,
+            commands::set_setting,
+            commands::app_info,
+            commands::recorder_state,
+            commands::start_recording,
+            commands::stop_recording,
+            commands::pause_recording,
+            commands::list_sources,
+            commands::list_meetings,
+            commands::update_meeting,
+            commands::recover_meeting,
+            commands::recordings_dir,
+            commands::choose_recordings_dir,
+            commands::open_recordings_dir,
+            commands::get_hotkey,
+            commands::set_hotkey,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building Earshot");
 
-#[cfg(test)]
-mod tests {
-    use super::check_setting;
-
-    #[test]
-    fn settings_are_validated() {
-        assert!(check_setting("theme", Some("dark")).is_ok());
-        assert!(check_setting("theme", Some("purple")).is_err());
-        assert!(check_setting("updates.autoCheck", Some("false")).is_ok());
-        assert!(check_setting("updates.autoCheck", Some("yes")).is_err());
-        assert!(check_setting("nope", None).is_err());
-        assert!(check_setting("theme", None).is_ok());
-    }
+    app.run(|app, event| {
+        // Quitting (tray, OS shutdown, updater) finalizes an active recording first.
+        if let RunEvent::ExitRequested { .. } = event {
+            let recorder = app.state::<Recorder>();
+            if recorder.is_active()
+                && let Err(e) = recorder.stop(app)
+            {
+                log::error!("failed to finalize recording on exit: {e}");
+            }
+        }
+    });
 }

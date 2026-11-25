@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Earshot records your microphone as its own track when you record a meeting. Audio stays on this Mac.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Earshot records the meeting audio playing on this Mac as a separate track. Audio stays on this Mac.</string>
+</dict>
+</plist>

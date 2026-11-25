@@ -4,7 +4,7 @@ A fully local meeting recorder and transcriber for Windows and macOS. Records yo
 the meeting audio as separate tracks, transcribes them with Whisper, labels speakers with
 open-source diarization, and can summarize with a local model. Nothing leaves the machine.
 
-> Status: early development (scaffold only).
+> Status: early development. Recording works (mic + meeting audio as separate crash-safe tracks); transcription is next.
 
 ## Development
 

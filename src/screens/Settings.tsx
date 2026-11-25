@@ -1,4 +1,5 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -6,6 +7,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ipc, type AppInfo, type Theme } from "@/lib/ipc";
 import { useTheme } from "@/lib/theme";
 import { useUpdates } from "@/lib/updates";
+import { RecordingSettings } from "@/screens/RecordingSettings";
 
 export function Settings() {
   return (
@@ -14,10 +16,14 @@ export function Settings() {
       <Tabs defaultValue="general" className="mt-6">
         <TabsList>
           <TabsTrigger value="general">General</TabsTrigger>
+          <TabsTrigger value="recording">Recording</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
         <TabsContent value="general" className="pt-4">
           <General />
+        </TabsContent>
+        <TabsContent value="recording" className="pt-4">
+          <RecordingSettings />
         </TabsContent>
         <TabsContent value="about" className="pt-4">
           <About />
@@ -27,14 +33,7 @@ export function Settings() {
   );
 }
 
-function Row({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="flex items-center justify-between gap-4 border-b border-border py-3 last:border-0">
-      <span className="text-sm">{label}</span>
-      {children}
-    </div>
-  );
-}
+const Row = SettingsRow;
 
 function General() {
   const { theme, setTheme } = useTheme();

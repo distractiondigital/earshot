@@ -14,14 +14,30 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.7.6", features = [] }
 
 [dependencies]
-tauri = { version = "=2.12.7", features = ["tray-icon", "image-png"] }
+tauri = { version = "=2.12.7", features = ["tray-icon", "image-png", "macos-private-api"] }
 rusqlite = { version = "=0.43.0", features = ["bundled"] }
 rusqlite_migration = "=2.9.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
+# Audio capture and storage
+cpal = "=0.18.2"
+rtrb = "=0.4.1"
+flacenc = { version = "=0.5.1", default-features = false }
+sysinfo = { version = "=0.40.4", default-features = false, features = ["system"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "=2.14.1"
 tauri-plugin-process = "=2.4.0"
+tauri-plugin-global-shortcut = "=2.4.1"
+tauri-plugin-single-instance = "=2.5.5"
+tauri-plugin-opener = "=2.7.3"
+tauri-plugin-dialog = "=2.8.4"
+tauri-plugin-log = "=2.10.2"
+
+[dev-dependencies]
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac"] }
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "=0.27.0"
