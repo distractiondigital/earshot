@@ -38,7 +38,7 @@ pub const QUICK_CONTINUE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub struct StartOptions {
     /// Microphone device id; `None` uses the system default.
     pub mic_device: Option<String>,
-    /// `None` uses the saved default (all system audio).
+    /// `None` uses the saved default (default system audio).
     pub system: Option<SystemSource>,
 }
 
@@ -492,7 +492,8 @@ fn system_source_for(
     warnings: &mut Vec<String>,
 ) -> Result<SystemSource, String> {
     match label {
-        None | Some("All system audio") => Ok(SystemSource::All),
+        // "All system audio" is the label older tracks were saved with.
+        None | Some("Default system audio" | "All system audio") => Ok(SystemSource::All),
         Some(name) => {
             if let Some(app) = capture::list_audio_apps()
                 .into_iter()
@@ -504,7 +505,7 @@ fn system_source_for(
                 })
             } else {
                 warnings.push(format!(
-                    "{name} isn't playing audio right now; recording all system audio instead."
+                    "{name} isn't playing audio right now; recording the default system audio instead."
                 ));
                 Ok(SystemSource::All)
             }

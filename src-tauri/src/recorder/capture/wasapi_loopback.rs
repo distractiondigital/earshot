@@ -1,5 +1,5 @@
 //! Windows meeting-audio capture via WASAPI:
-//! - all system audio: loopback on the default render device;
+//! - default system audio: loopback on the default output device;
 //! - one output device: loopback on that render device (e.g. a virtual "Voice Chat" device);
 //! - a single app: process loopback (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, Windows 10
 //!   build 20348+), which includes the app's child processes.
@@ -67,7 +67,7 @@ pub fn prepare(target: Target) -> Result<Prepared, String> {
         ));
     }
     let label = match &target {
-        Target::Default => "All system audio".to_owned(),
+        Target::Default => "Default system audio".to_owned(),
         Target::Device { name, .. } | Target::App { name, .. } => name.clone(),
     };
     Ok(Prepared {

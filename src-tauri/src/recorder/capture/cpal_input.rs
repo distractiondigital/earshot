@@ -124,7 +124,7 @@ pub fn prepare_output_loopback(device_id_wanted: Option<&str>) -> Result<Prepare
         .map_err(|e| format!("System audio unavailable: {e}"))?;
     let mut p = prepare(device, config);
     if device_id_wanted.is_none() {
-        p.label = "All system audio".into();
+        p.label = "Default system audio".into();
     }
     Ok(p)
 }

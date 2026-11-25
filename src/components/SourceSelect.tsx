@@ -32,7 +32,7 @@ function keyOf(s: SystemSource): string {
 }
 
 /**
- * Picker for the meeting-audio track: all system audio, one output device (what it plays),
+ * Picker for the meeting-audio track: the default output device, one output device (what it plays),
  * one input device, one app, or none (microphone only).
  */
 export function SourceSelect({
@@ -80,7 +80,7 @@ export function SourceSelect({
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value="all">All system audio</SelectItem>
+        <SelectItem value="all">Default system audio</SelectItem>
         <SelectItem value="none">Microphone only</SelectItem>
         {missing && "name" in value && (
           <SelectItem value={current}>
