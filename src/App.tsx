@@ -2,6 +2,7 @@ import { useState } from "react";
 import { AudioLines, Settings as SettingsIcon, Users } from "lucide-react";
 import { cn } from "cn";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { MeetingView } from "@/screens/MeetingView";
 import { Meetings } from "@/screens/Meetings";
 import { Speakers } from "@/screens/Speakers";
 import { Settings } from "@/screens/Settings";
@@ -16,6 +17,13 @@ const NAV: { id: Screen; label: string; icon: typeof Users }[] = [
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("meetings");
+  const [openMeeting, setOpenMeeting] = useState<number | null>(null);
+  const [settingsTab, setSettingsTab] = useState("general");
+  const go = (s: Screen) => {
+    setScreen(s);
+    setOpenMeeting(null);
+    if (s === "settings") setSettingsTab("general");
+  };
 
   return (
     <div className="flex h-screen bg-background text-foreground select-none">
@@ -25,7 +33,7 @@ export default function App() {
           <button
             key={id}
             type="button"
-            onClick={() => setScreen(id)}
+            onClick={() => go(id)}
             aria-current={screen === id ? "page" : undefined}
             className={cn(
               "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground outline-none",
@@ -40,9 +48,20 @@ export default function App() {
       </nav>
       <div className="flex min-w-0 flex-1 flex-col">
         <main className="flex-1 overflow-y-auto">
-          {screen === "meetings" && <Meetings />}
+          {screen === "meetings" && openMeeting === null && (
+            <Meetings
+              onOpen={setOpenMeeting}
+              onSetupTranscription={() => {
+                setScreen("settings");
+                setSettingsTab("transcription");
+              }}
+            />
+          )}
+          {screen === "meetings" && openMeeting !== null && (
+            <MeetingView id={openMeeting} onBack={() => setOpenMeeting(null)} />
+          )}
           {screen === "speakers" && <Speakers />}
-          {screen === "settings" && <Settings />}
+          {screen === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} />}
         </main>
         <UpdateBanner />
       </div>

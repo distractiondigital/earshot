@@ -1,44 +1,107 @@
 //! `earshot-worker`: the inference sidecar. Runs as a separate process so that a model crash
 //! (OOM, driver fault) never takes down the main app or an in-progress recording.
 //!
-//! Protocol: one JSON object per line on stdin (requests) and stdout (replies). The worker
-//! exits when stdin closes. M0 implements only `ping`; job messages arrive in M2.
+//! Protocol (see `earshot-protocol`): one JSON request per line on stdin, one JSON event per line
+//! on stdout. Diagnostics go to stderr. The worker exits when stdin closes.
+
+mod audio;
+mod transcribe;
+mod vad;
 
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
+use earshot_protocol::{ErrorCode, Event, Request};
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Request {
-    Ping { id: u64 },
+/// Messages for the stdout writer thread.
+enum Out {
+    Event(Event),
+    Shutdown,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Reply<'a> {
-    Pong {
-        id: u64,
-        version: &'a str,
-    },
-    Error {
-        id: Option<u64>,
-        code: &'a str,
-        message: String,
-    },
+impl From<Event> for Out {
+    fn from(e: Event) -> Self {
+        Out::Event(e)
+    }
 }
 
-fn handle(line: &str) -> Reply<'static> {
-    match serde_json::from_str::<Request>(line) {
-        Ok(Request::Ping { id }) => Reply::Pong {
-            id,
-            version: env!("CARGO_PKG_VERSION"),
-        },
-        Err(e) => Reply::Error {
-            id: None,
-            code: "bad_request",
-            message: e.to_string(),
-        },
+struct Running {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+fn error(id: u64, code: ErrorCode, message: impl Into<String>) -> Event {
+    Event::Error {
+        id,
+        code,
+        message: message.into(),
+        suggestion: None,
+    }
+}
+
+fn handle(
+    line: &str,
+    out: &Sender<Out>,
+    running: &Arc<Mutex<Option<Running>>>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let req = match serde_json::from_str::<Request>(line) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = out.send(Out::from(error(0, ErrorCode::BadRequest, e.to_string())));
+            return None;
+        }
+    };
+    match req {
+        Request::Ping { id } => {
+            let _ = out.send(Out::from(Event::Pong {
+                id,
+                version: env!("CARGO_PKG_VERSION").into(),
+                gpu_backend: transcribe::gpu_backend().map(Into::into),
+            }));
+            None
+        }
+        Request::Cancel { id } => {
+            if let Some(r) = running.lock().unwrap().as_ref().filter(|r| r.id == id) {
+                r.cancel.store(true, Ordering::Relaxed);
+            }
+            None
+        }
+        Request::Transcribe { id, job } => {
+            let mut slot = running.lock().unwrap();
+            if slot.is_some() {
+                let _ = out.send(Out::from(error(
+                    id,
+                    ErrorCode::BadRequest,
+                    "a job is already running",
+                )));
+                return None;
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            *slot = Some(Running {
+                id,
+                cancel: cancel.clone(),
+            });
+            drop(slot);
+            let (out, running) = (out.clone(), running.clone());
+            Some(std::thread::spawn(move || {
+                let progress_out = out.clone();
+                let result = transcribe::run(&job, &cancel, move |stage, pct| {
+                    let _ = progress_out.send(Out::from(Event::Progress { id, stage, pct }));
+                });
+                *running.lock().unwrap() = None;
+                let _ = out.send(Out::from(match result {
+                    Ok(transcript) => Event::Result { id, transcript },
+                    Err(e) => Event::Error {
+                        id,
+                        code: e.code,
+                        message: e.message,
+                        suggestion: e.suggestion,
+                    },
+                }));
+            }))
+        }
     }
 }
 
@@ -47,18 +110,63 @@ fn main() -> io::Result<()> {
         println!("earshot-worker {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
-    for line in stdin.lines() {
+    // whisper.cpp / ggml diagnostics -> log -> stderr (the app captures it into its log file).
+    whisper_rs::install_logging_hooks();
+    struct StderrLog;
+    impl log::Log for StderrLog {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Info
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                eprintln!("[{}] {}", r.level(), r.args());
+            }
+        }
+        fn flush(&self) {}
+    }
+    let _ = log::set_logger(&StderrLog);
+    log::set_max_level(log::LevelFilter::Info);
+
+    // A single writer thread keeps events whole on stdout.
+    let (tx, rx) = mpsc::channel::<Out>();
+    let writer = std::thread::spawn(move || {
+        let mut stdout = io::stdout().lock();
+        // Ends on an explicit shutdown: a Sender clone may be leaked inside whisper's progress
+        // callback, so waiting for every sender to drop would hang forever.
+        while let Ok(Out::Event(ev)) = rx.recv() {
+            let line = serde_json::to_string(&ev).expect("event serializes");
+            if writeln!(stdout, "{line}")
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let running = Arc::new(Mutex::new(None));
+    let mut job = None;
+    for line in io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let reply = serde_json::to_string(&handle(&line)).expect("reply serializes");
-        writeln!(stdout, "{reply}")?;
-        stdout.flush()?;
+        if let Some(j) = handle(&line, &tx, &running) {
+            job = Some(j);
+        }
     }
-    Ok(())
+    // stdin closed: cancel any running job and exit.
+    if let Some(r) = running.lock().unwrap().as_ref() {
+        r.cancel.store(true, Ordering::Relaxed);
+    }
+    if let Some(j) = job {
+        let _ = j.join();
+    }
+    let _ = tx.send(Out::Shutdown);
+    let _ = writer.join();
+    // All events are flushed. Exit without running library teardown: the CUDA backend can hang
+    // in its process-exit cleanup after a job, leaving a worker process behind.
+    std::process::exit(0)
 }
 
 #[cfg(test)]
@@ -67,16 +175,29 @@ mod tests {
 
     #[test]
     fn ping_returns_pong() {
-        let v = serde_json::to_value(handle(r#"{"type":"ping","id":7}"#)).unwrap();
-        assert_eq!(v["type"], "pong");
-        assert_eq!(v["id"], 7);
-        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let (tx, rx) = mpsc::channel();
+        let running = Arc::new(Mutex::new(None));
+        handle(r#"{"type":"ping","id":7}"#, &tx, &running);
+        match rx.recv().unwrap() {
+            Out::Event(Event::Pong { id, version, .. }) => {
+                assert_eq!(id, 7);
+                assert_eq!(version, env!("CARGO_PKG_VERSION"));
+            }
+            Out::Event(e) => panic!("{e:?}"),
+            Out::Shutdown => panic!("shutdown"),
+        }
     }
 
     #[test]
     fn bad_request_returns_error() {
-        let v = serde_json::to_value(handle(r#"{"type":"nope"}"#)).unwrap();
-        assert_eq!(v["type"], "error");
-        assert_eq!(v["code"], "bad_request");
+        let (tx, rx) = mpsc::channel();
+        handle(r#"{"type":"nope"}"#, &tx, &Arc::new(Mutex::new(None)));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Out::Event(Event::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            })
+        ));
     }
 }

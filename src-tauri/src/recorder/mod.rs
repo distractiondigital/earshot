@@ -311,6 +311,9 @@ impl Recorder {
         crate::pill::hide(app);
         self.emit_state(app);
         let _ = app.emit(EVENT_STOPPED, session.meeting_id);
+        if status == "queued" {
+            crate::processing::auto_enqueue(app, session.meeting_id);
+        }
         Ok(session.meeting_id)
     }
 

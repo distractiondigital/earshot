@@ -25,6 +25,13 @@ log.workspace = true
 cpal = "=0.18.2"
 rtrb = "=0.4.1"
 flacenc = { version = "=0.5.1", default-features = false }
+# Model manager and transcription jobs
+earshot-protocol = { path = "../crates/earshot-protocol" }
+reqwest = { version = "=0.13.5", default-features = false, features = ["stream", "rustls", "http2"] }
+futures-util = "=0.3.34"
+tokio = { version = "=1.54.1", features = ["fs", "io-util", "sync", "time"] }
+sha2 = "=0.11.1"
+sysinfo = { version = "=0.40.4", default-features = false, features = ["system"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "=2.14.1"
@@ -36,9 +43,11 @@ tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-log = "=2.10.2"
 
 [dev-dependencies]
-sysinfo = { version = "=0.40.4", default-features = false, features = ["system"] }
 symphonia = { version = "=0.6.1", default-features = false, features = ["flac"] }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "=0.27.0"
-sysinfo = { version = "=0.40.4", default-features = false, features = ["system"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# NVIDIA GPU / VRAM detection (loads the driver's NVML library at runtime; absent = no NVIDIA GPU).
+nvml-wrapper = "=0.13.0"

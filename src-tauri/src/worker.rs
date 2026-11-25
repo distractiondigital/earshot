@@ -1,7 +1,5 @@
-//! Client side of the `earshot-worker` sidecar (all ML inference runs there, never in this process).
-//!
-//! IPC is newline-delimited JSON over the child's stdin/stdout. M0 only implements a ping
-//! handshake to prove the sidecar is bundled and launchable; the job protocol arrives in M2.
+//! Locating and pinging the `earshot-worker` sidecar (all ML inference runs there, never in this
+//! process). Job execution lives in `processing.rs`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -9,29 +7,44 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use earshot_protocol::{Event, Request};
+
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tauri places `externalBin` sidecars next to the main executable (without the target-triple
 /// suffix). In development, Cargo builds the worker into the same `target/<profile>` directory.
-fn worker_path() -> Option<PathBuf> {
+pub fn worker_path() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let path = dir.join(format!("earshot-worker{}", std::env::consts::EXE_SUFFIX));
     path.is_file().then_some(path)
 }
 
-/// Spawns the worker, sends a ping and returns the version it reports.
-pub fn ping() -> Result<String, String> {
+/// A worker command with no console window on Windows.
+pub fn command() -> Result<Command, String> {
     let path = worker_path().ok_or("earshot-worker binary not found")?;
+    #[allow(unused_mut)]
     let mut cmd = Command::new(path);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    Ok(cmd)
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerInfo {
+    pub version: String,
+    pub gpu_backend: Option<String>,
+}
+
+/// Spawns the worker, sends a ping and returns what it reports.
+pub fn ping() -> Result<WorkerInfo, String> {
+    let mut cmd = command()?;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start worker: {e}"))?;
@@ -45,7 +58,7 @@ pub fn ping() -> Result<String, String> {
         let _ = tx.send(res);
     });
 
-    let request = serde_json::json!({ "type": "ping", "id": 1 });
+    let request = serde_json::to_string(&Request::Ping { id: 1 }).expect("serializes");
     let sent = writeln!(stdin, "{request}").and_then(|_| stdin.flush());
     drop(stdin); // EOF tells the worker to exit after replying.
 
@@ -62,13 +75,30 @@ pub fn ping() -> Result<String, String> {
     result
 }
 
-fn parse_pong(line: &str) -> Result<String, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(line.trim()).map_err(|e| format!("invalid worker reply: {e}"))?;
-    match (v["type"].as_str(), v["id"].as_u64(), v["version"].as_str()) {
-        (Some("pong"), Some(1), Some(version)) => Ok(version.to_owned()),
-        _ => Err(format!("unexpected worker reply: {}", line.trim())),
+fn parse_pong(line: &str) -> Result<WorkerInfo, String> {
+    match serde_json::from_str::<Event>(line.trim()) {
+        Ok(Event::Pong {
+            id: 1,
+            version,
+            gpu_backend,
+        }) => Ok(WorkerInfo {
+            version,
+            gpu_backend,
+        }),
+        Ok(other) => Err(format!("unexpected worker reply: {other:?}")),
+        Err(e) => Err(format!("invalid worker reply: {e}")),
     }
+}
+
+/// Cached worker info (the GPU backend never changes while the app runs).
+pub fn info() -> Option<WorkerInfo> {
+    static INFO: std::sync::OnceLock<Option<WorkerInfo>> = std::sync::OnceLock::new();
+    INFO.get_or_init(|| {
+        ping()
+            .inspect_err(|e| log::warn!("worker ping failed: {e}"))
+            .ok()
+    })
+    .clone()
 }
 
 #[cfg(test)]
@@ -77,11 +107,18 @@ mod tests {
 
     #[test]
     fn parses_pong() {
+        let i =
+            parse_pong(r#"{"type":"pong","id":1,"version":"0.1.0","gpu_backend":"cuda"}"#).unwrap();
         assert_eq!(
-            parse_pong(r#"{"type":"pong","id":1,"version":"0.1.0"}"#).unwrap(),
-            "0.1.0"
+            (i.version.as_str(), i.gpu_backend.as_deref()),
+            ("0.1.0", Some("cuda"))
         );
-        assert!(parse_pong(r#"{"type":"error","id":1}"#).is_err());
+        assert!(
+            parse_pong(
+                r#"{"type":"error","id":1,"code":"bad_request","message":"x","suggestion":null}"#
+            )
+            .is_err()
+        );
         assert!(parse_pong("not json").is_err());
     }
 }

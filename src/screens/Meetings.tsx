@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { parseSavedSource, SourceSelect } from "@/components/SourceSelect";
+import { processing, useModels, useProcessing, type Job } from "@/lib/models";
 import { ipc } from "@/lib/ipc";
 import {
   formatDuration,
@@ -22,8 +23,17 @@ import {
   type SystemSource,
 } from "@/lib/recorder";
 
-export function Meetings() {
+export function Meetings({
+  onOpen,
+  onSetupTranscription,
+}: {
+  onOpen: (id: number) => void;
+  onSetupTranscription: () => void;
+}) {
   const state = useRecorderState();
+  const { jobs, live, refresh: refreshJobs } = useProcessing();
+  const { info: modelsInfo } = useModels();
+  const noModel = modelsInfo !== null && !modelsInfo.models.some((m) => m.selected);
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [detailsFor, setDetailsFor] = useState<number | null>(null);
@@ -41,9 +51,10 @@ export function Meetings() {
       setDetailsFor(e.payload);
     });
     const unState = listen("recorder://state", refresh);
+    const unProc = listen("processing://changed", refresh);
     const unError = listen<string>("recorder://error", (e) => setError(e.payload));
     return () => {
-      for (const u of [unStopped, unState, unError]) u.then((f) => f());
+      for (const u of [unStopped, unState, unError, unProc]) u.then((f) => f());
     };
   }, [refresh]);
 
@@ -74,12 +85,34 @@ export function Meetings() {
 
       {recording && <HeadphonesTip />}
 
+      {!recording && noModel && (
+        <div className="mt-4 flex items-center gap-3 rounded-md bg-muted/60 px-3 py-2 text-sm">
+          <p className="flex-1 text-muted-foreground">
+            Recordings are saved, but transcription isn't set up yet.
+          </p>
+          <Button size="sm" variant="outline" onClick={onSetupTranscription}>
+            Choose a model
+          </Button>
+        </div>
+      )}
+
       {meetings && meetings.length > 0 && (
         <ul className="mt-6 divide-y divide-border border-t border-border" aria-label="Meetings">
           {meetings
             .filter((m) => m.status !== "recording")
             .map((m) => (
-              <MeetingRow key={m.id} meeting={m} onChanged={refresh} onEdit={() => setDetailsFor(m.id)} onError={setError} />
+              <MeetingRow
+                key={m.id}
+                meeting={m}
+                job={jobs[m.id]}
+                livePct={live?.meetingId === m.id ? live.pct : null}
+                onChanged={() => {
+                  refresh();
+                  refreshJobs();
+                }}
+                onOpen={() => onOpen(m.id)}
+                onError={setError}
+              />
             ))}
         </ul>
       )}
@@ -275,20 +308,24 @@ const STATUS: Record<Meeting["status"], string> = {
 
 function MeetingRow({
   meeting: m,
+  job,
+  livePct,
   onChanged,
-  onEdit,
+  onOpen,
   onError,
 }: {
   meeting: Meeting;
+  job: Job | undefined;
+  livePct: number | null;
   onChanged: () => void;
-  onEdit: () => void;
+  onOpen: () => void;
   onError: (e: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const recover = async () => {
+  const act = async (p: () => Promise<unknown>) => {
     setBusy(true);
     try {
-      await recorder.recover(m.id);
+      await p();
     } catch (e) {
       onError(String(e));
     } finally {
@@ -297,9 +334,12 @@ function MeetingRow({
     }
   };
   const date = new Date(m.startedAt);
+  const waiting = job?.status === "queued";
+  const running = m.status === "processing" || job?.status === "running";
+  const pct = Math.round(livePct ?? job?.progress ?? 0);
   return (
     <li className="flex items-center gap-4 py-3">
-      <button type="button" onClick={onEdit} className="min-w-0 flex-1 text-left outline-none focus-visible:underline">
+      <button type="button" onClick={onOpen} className="min-w-0 flex-1 text-left outline-none focus-visible:underline">
         <div className="truncate text-sm font-medium">{m.title || "Untitled meeting"}</div>
         <div className="text-xs text-muted-foreground">
           {date.toLocaleDateString(undefined, { dateStyle: "medium" })} ·{" "}
@@ -307,21 +347,49 @@ function MeetingRow({
           {m.durationMs > 0 && ` · ${formatDuration(m.durationMs)}`}
           {m.tags.length > 0 && ` · ${m.tags.join(", ")}`}
         </div>
-        {m.error && <div className="mt-1 text-xs whitespace-pre-line text-destructive">{m.error}</div>}
+        {m.error && (
+          <div
+            className={`mt-1 text-xs whitespace-pre-line ${m.status === "failed" || m.status === "incomplete" ? "text-destructive" : "text-muted-foreground"}`}
+          >
+            {m.error}
+          </div>
+        )}
       </button>
       {m.status === "incomplete" ? (
-        <Button size="sm" variant="outline" onClick={recover} disabled={busy}>
+        <Button size="sm" variant="outline" onClick={() => act(() => recorder.recover(m.id))} disabled={busy}>
           {busy ? "Recovering…" : "Recover"}
         </Button>
+      ) : running || waiting ? (
+        <div className="flex items-center gap-2">
+          <span className="w-28 text-right text-xs text-muted-foreground tabular-nums" role="status">
+            {running ? `Transcribing ${pct}%` : "Waiting…"}
+          </span>
+          <Button size="sm" variant="ghost" onClick={() => act(() => processing.cancel(m.id))} disabled={busy}>
+            Cancel
+          </Button>
+        </div>
+      ) : m.status === "failed" ? (
+        <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={() => act(() => processing.transcribe(m.id))} disabled={busy}>
+            Retry
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => act(() => processing.transcribe(m.id, true))} disabled={busy}>
+            Retry on CPU
+          </Button>
+        </div>
+      ) : m.status === "queued" ? (
+        <Button size="sm" variant="outline" onClick={() => act(() => processing.transcribe(m.id))} disabled={busy}>
+          Transcribe
+        </Button>
       ) : (
-        <Badge variant={m.status === "failed" ? "destructive" : "secondary"}>{STATUS[m.status]}</Badge>
+        <Badge variant="secondary">{STATUS[m.status]}</Badge>
       )}
     </li>
   );
 }
 
 /** Optional details collected after stopping (skippable). */
-function DetailsDialog({ meeting, onClose }: { meeting: Meeting | null; onClose: () => void }) {
+export function DetailsDialog({ meeting, onClose }: { meeting: Meeting | null; onClose: () => void }) {
   const [title, setTitle] = useState(meeting?.title ?? "");
   const [speakers, setSpeakers] = useState(meeting?.remoteSpeakerCountHint ? String(meeting.remoteSpeakerCountHint) : "auto");
   const [tags, setTags] = useState(meeting?.tags.join(", ") ?? "");

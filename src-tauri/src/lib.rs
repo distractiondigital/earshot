@@ -1,7 +1,9 @@
 mod commands;
 mod db;
 mod hotkey;
+mod models;
 mod pill;
+mod processing;
 mod recorder;
 mod tray;
 mod worker;
@@ -42,6 +44,9 @@ pub fn run() {
             }
             app.manage(db);
             app.manage(Recorder::default());
+            app.manage(models::download::Downloads::default());
+            let processor = processing::Processor::start(app.handle());
+            app.manage(processor);
             tray::build(app.handle())?;
             hotkey::register_saved(app.handle());
             Ok(())
@@ -74,6 +79,15 @@ pub fn run() {
             commands::open_recordings_dir,
             commands::get_hotkey,
             commands::set_hotkey,
+            commands::list_models,
+            commands::download_model,
+            commands::cancel_download,
+            commands::delete_model,
+            commands::select_model,
+            commands::transcribe_meeting,
+            commands::cancel_processing,
+            commands::processing_jobs,
+            commands::get_transcript,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Earshot");

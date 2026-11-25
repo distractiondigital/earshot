@@ -8,15 +8,17 @@ import { ipc, type AppInfo, type Theme } from "@/lib/ipc";
 import { useTheme } from "@/lib/theme";
 import { useUpdates } from "@/lib/updates";
 import { RecordingSettings } from "@/screens/RecordingSettings";
+import { TranscriptionSettings } from "@/screens/TranscriptionSettings";
 
-export function Settings() {
+export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => void }) {
   return (
     <div className="mx-auto max-w-3xl p-8">
       <h1 className="text-lg font-semibold">Settings</h1>
-      <Tabs defaultValue="general" className="mt-6">
+      <Tabs value={tab} onValueChange={onTab} className="mt-6">
         <TabsList>
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="recording">Recording</TabsTrigger>
+          <TabsTrigger value="transcription">Transcription</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
         <TabsContent value="general" className="pt-4">
@@ -24,6 +26,9 @@ export function Settings() {
         </TabsContent>
         <TabsContent value="recording" className="pt-4">
           <RecordingSettings />
+        </TabsContent>
+        <TabsContent value="transcription" className="pt-4">
+          <TranscriptionSettings />
         </TabsContent>
         <TabsContent value="about" className="pt-4">
           <About />

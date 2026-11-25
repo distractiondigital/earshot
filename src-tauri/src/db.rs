@@ -12,6 +12,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/0001_init.sql")),
         M::up(include_str!("../migrations/0002_recording.sql")),
         M::up(include_str!("../migrations/0003_source_spec.sql")),
+        M::up(include_str!("../migrations/0004_jobs.sql")),
     ])
 });
 
@@ -33,6 +34,56 @@ pub struct MeetingRow {
     pub error: Option<String>,
     pub remote_speaker_count_hint: Option<i64>,
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRow {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub kind: String,
+    pub stage: Option<String>,
+    pub progress: f64,
+    pub status: String,
+    pub error: Option<String>,
+    pub options: Option<String>,
+}
+
+/// One utterance to store: a run of words on one track without a long pause.
+#[derive(Debug, Clone, Default)]
+pub struct NewUtterance {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub words: Vec<NewWord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewWord {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub prob: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UtteranceRow {
+    pub id: i64,
+    pub track_kind: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub words: Vec<WordRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WordRow {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub prob: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -203,6 +254,194 @@ impl Db {
         Ok(())
     }
 
+    // ---- Processing jobs ----
+
+    /// Queues a job unless one is already queued or running for this meeting. Returns its id.
+    pub fn enqueue_job(
+        &self,
+        meeting_id: i64,
+        kind: &str,
+        options: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let c = self.conn();
+        if let Some(id) = c
+            .query_row(
+                "SELECT id FROM jobs WHERE meeting_id = ?1 AND kind = ?2 AND status IN ('queued', 'running')",
+                params![meeting_id, kind],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        c.execute(
+            "INSERT INTO jobs (meeting_id, kind, status, progress, options, created_at, updated_at)
+             VALUES (?1, ?2, 'queued', 0, ?3, ?4, ?4)",
+            params![meeting_id, kind, options, now_ms()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
+        Ok(JobRow {
+            id: r.get(0)?,
+            meeting_id: r.get(1)?,
+            kind: r.get(2)?,
+            stage: r.get(3)?,
+            progress: r.get(4)?,
+            status: r.get(5)?,
+            error: r.get(6)?,
+            options: r.get(7)?,
+        })
+    }
+
+    pub fn next_queued_job(&self) -> Result<Option<JobRow>, DbError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, meeting_id, kind, stage, progress, status, error, options FROM jobs
+                 WHERE status = 'queued' ORDER BY created_at, id LIMIT 1",
+                [],
+                Self::job_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Latest job of each meeting (for status display).
+    pub fn latest_jobs(&self) -> Result<Vec<JobRow>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT id, meeting_id, kind, stage, progress, status, error, options FROM jobs j
+             WHERE id = (SELECT max(id) FROM jobs WHERE meeting_id = j.meeting_id)",
+        )?;
+        let rows = stmt.query_map([], Self::job_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn update_job(
+        &self,
+        id: i64,
+        status: &str,
+        stage: Option<&str>,
+        progress: f64,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE jobs SET status = ?2, stage = ?3, progress = ?4, error = ?5, updated_at = ?6 WHERE id = ?1",
+            params![id, status, stage, progress, error, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Cancels a meeting's queued (not yet running) jobs. Returns how many.
+    pub fn cancel_queued_jobs(&self, meeting_id: i64) -> Result<usize, DbError> {
+        Ok(self.conn().execute(
+            "UPDATE jobs SET status = 'cancelled', updated_at = ?2 WHERE meeting_id = ?1 AND status = 'queued'",
+            params![meeting_id, now_ms()],
+        )?)
+    }
+
+    /// Jobs and meetings left running by a crash are queued again.
+    pub fn requeue_interrupted_jobs(&self) -> Result<usize, DbError> {
+        let c = self.conn();
+        let n = c.execute(
+            "UPDATE jobs SET status = 'queued', stage = NULL, progress = 0, updated_at = ?1 WHERE status = 'running'",
+            [now_ms()],
+        )?;
+        c.execute(
+            "UPDATE meetings SET status = 'queued' WHERE status = 'processing'",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    // ---- Transcripts ----
+
+    /// Replaces one track's transcript (idempotent re-runs). Words cascade; FTS stays in sync.
+    pub fn replace_track_transcript(
+        &self,
+        meeting_id: i64,
+        track_kind: &str,
+        utterances: &[NewUtterance],
+    ) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute(
+            "DELETE FROM utterances WHERE meeting_id = ?1 AND track_kind = ?2",
+            params![meeting_id, track_kind],
+        )?;
+        {
+            let mut ins_u = tx.prepare(
+                "INSERT INTO utterances (meeting_id, track_kind, start_ms, end_ms, text) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            let mut ins_w = tx.prepare(
+                "INSERT INTO words (utterance_id, start_ms, end_ms, text, prob) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for u in utterances {
+                ins_u.execute(params![
+                    meeting_id, track_kind, u.start_ms, u.end_ms, u.text
+                ])?;
+                let uid = tx.last_insert_rowid();
+                for w in &u.words {
+                    ins_w.execute(params![
+                        uid,
+                        w.start_ms,
+                        w.end_ms,
+                        w.text,
+                        f64::from(w.prob)
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_meeting_language(&self, id: i64, language: &str) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE meetings SET language = ?2 WHERE id = ?1",
+            params![id, language],
+        )?;
+        Ok(())
+    }
+
+    /// All utterances of a meeting in time order, with their words.
+    pub fn transcript(&self, meeting_id: i64) -> Result<Vec<UtteranceRow>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT id, track_kind, start_ms, end_ms, text FROM utterances WHERE meeting_id = ?1
+             ORDER BY start_ms, id",
+        )?;
+        let mut out: Vec<UtteranceRow> = stmt
+            .query_map([meeting_id], |r| {
+                Ok(UtteranceRow {
+                    id: r.get(0)?,
+                    track_kind: r.get(1)?,
+                    start_ms: r.get(2)?,
+                    end_ms: r.get(3)?,
+                    text: r.get(4)?,
+                    words: Vec::new(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut wstmt = c.prepare(
+            "SELECT start_ms, end_ms, text, prob FROM words WHERE utterance_id = ?1 ORDER BY start_ms, id",
+        )?;
+        for u in &mut out {
+            u.words = wstmt
+                .query_map([u.id], |r| {
+                    Ok(WordRow {
+                        start_ms: r.get(0)?,
+                        end_ms: r.get(1)?,
+                        text: r.get(2)?,
+                        prob: r.get(3)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(out)
+    }
+
     /// Meetings left in `recording` by a crash become `incomplete` (offered for recovery).
     pub fn mark_interrupted(&self) -> Result<usize, DbError> {
         Ok(self.conn().execute(
@@ -279,7 +518,7 @@ mod tests {
     #[test]
     fn migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -366,5 +605,56 @@ mod tests {
         assert_eq!(m.tags, vec!["team".to_string()]);
         let tr = &db.tracks(id).unwrap()[0];
         assert!(tr.finalized && tr.duration_ms == 5_000 && tr.source.as_deref() == Some("Mic"));
+    }
+
+    #[test]
+    fn jobs_and_transcripts() {
+        let db = Db::open_in_memory().unwrap();
+        let m = db.create_meeting(0, "").unwrap();
+        let j = db.enqueue_job(m, "transcribe", None).unwrap();
+        assert_eq!(
+            db.enqueue_job(m, "transcribe", None).unwrap(),
+            j,
+            "no duplicate queued job"
+        );
+        assert_eq!(db.next_queued_job().unwrap().unwrap().id, j);
+        db.update_job(j, "running", Some("transcribe"), 50.0, None)
+            .unwrap();
+        assert!(db.next_queued_job().unwrap().is_none());
+        assert_eq!(db.requeue_interrupted_jobs().unwrap(), 1);
+        assert_eq!(db.next_queued_job().unwrap().unwrap().status, "queued");
+
+        let utt = |s: i64, text: &str| NewUtterance {
+            start_ms: s,
+            end_ms: s + 500,
+            text: text.into(),
+            words: vec![NewWord {
+                start_ms: s,
+                end_ms: s + 500,
+                text: format!(" {text}"),
+                prob: 0.9,
+            }],
+        };
+        db.replace_track_transcript(m, "system", &[utt(2000, "hello")])
+            .unwrap();
+        db.replace_track_transcript(m, "mic", &[utt(1000, "hi")])
+            .unwrap();
+        db.replace_track_transcript(m, "system", &[utt(3000, "world")])
+            .unwrap();
+        let t = db.transcript(m).unwrap();
+        assert_eq!(
+            t.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(),
+            ["hi", "world"]
+        );
+        assert_eq!(t[1].words[0].text, " world");
+        let fts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0, "replaced text is gone from search");
     }
 }

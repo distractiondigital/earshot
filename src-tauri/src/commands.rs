@@ -7,7 +7,8 @@ use tauri::{AppHandle, Manager, State};
 use crate::db::{Db, MeetingRow};
 use crate::recorder::capture::{self, AudioApp, InputDevice};
 use crate::recorder::{self, Recorder, RecorderState, StartOptions};
-use crate::{hotkey, worker};
+use crate::{hotkey, models, worker};
+use tauri::Emitter;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -32,9 +33,13 @@ const SETTINGS: &[(&str, Option<&[&str]>)] = &[
     ("recording.showPill", Some(&["true", "false"])),
     ("recording.consentReminder", Some(&["true", "false"])),
     ("ui.headphonesTipShown", Some(&["true", "false"])),
+    // "auto" or an ISO 639-1 code.
+    ("transcription.language", None),
+    ("transcription.backend", Some(&["auto", "gpu", "cpu"])),
+    ("transcription.autoProcess", Some(&["true", "false"])),
 ];
 /// Readable but only changed through dedicated commands.
-const READ_ONLY_SETTINGS: &[&str] = &["recording.dir", "recording.hotkey"];
+const READ_ONLY_SETTINGS: &[&str] = &["recording.dir", "recording.hotkey", "transcription.model"];
 
 pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String> {
     if value.is_none() && READ_ONLY_SETTINGS.contains(&key) {
@@ -87,11 +92,13 @@ pub struct AppInfo {
 
 #[tauri::command]
 pub async fn app_info(app: AppHandle, db: State<'_, Db>) -> Result<AppInfo, String> {
-    let worker_version = tauri::async_runtime::spawn_blocking(worker::ping)
+    let worker_version = tauri::async_runtime::spawn_blocking(worker::info)
         .await
         .map_err(err)?
-        .inspect_err(|e| log::warn!("worker ping failed: {e}"))
-        .ok();
+        .map(|w| match w.gpu_backend {
+            Some(gpu) => format!("{} ({gpu})", w.version),
+            None => w.version,
+        });
     Ok(AppInfo {
         version: app.package_info().version.to_string(),
         schema_version: db.schema_version().map_err(err)?,
@@ -203,7 +210,108 @@ pub fn update_meeting(
 
 #[tauri::command]
 pub async fn recover_meeting(app: AppHandle, id: i64) -> Result<i64, String> {
-    blocking(move || recorder::recover(&app.state::<Db>(), id)).await
+    blocking(move || {
+        let ms = recorder::recover(&app.state::<Db>(), id)?;
+        crate::processing::auto_enqueue(&app, id);
+        Ok(ms)
+    })
+    .await
+}
+
+// ---- Models ----
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsInfo {
+    hardware: models::hardware::Hardware,
+    recommended: &'static str,
+    models: Vec<models::ModelView>,
+}
+
+fn hardware() -> &'static models::hardware::Hardware {
+    static HW: std::sync::OnceLock<models::hardware::Hardware> = std::sync::OnceLock::new();
+    HW.get_or_init(|| models::hardware::detect(worker::info().and_then(|w| w.gpu_backend)))
+}
+
+#[tauri::command]
+pub async fn list_models(app: AppHandle) -> Result<ModelsInfo, String> {
+    blocking(move || {
+        let hw = hardware().clone();
+        let recommended = models::hardware::recommend(&hw);
+        Ok(ModelsInfo {
+            models: models::list(&app, recommended),
+            hardware: hw,
+            recommended,
+        })
+    })
+    .await
+}
+
+/// Downloads a model (and the small VAD model alongside a transcription model).
+#[tauri::command]
+pub fn download_model(app: AppHandle, id: String) -> Result<(), String> {
+    let m = models::find(&id).ok_or("unknown model")?;
+    models::download::start(&app, m);
+    if m.category == "transcription" {
+        models::download::start(&app, models::vad_model());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_download(app: AppHandle, id: String) {
+    app.state::<models::download::Downloads>().cancel(&id);
+}
+
+#[tauri::command]
+pub fn delete_model(app: AppHandle, id: String) -> Result<(), String> {
+    models::delete(&app, &id)?;
+    let _ = app.emit(
+        models::EVENT_CHANGED,
+        serde_json::json!({ "id": id, "error": null }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn select_model(app: AppHandle, id: String) -> Result<(), String> {
+    models::select(&app, &id)?;
+    let _ = app.emit(
+        models::EVENT_CHANGED,
+        serde_json::json!({ "id": id, "error": null }),
+    );
+    Ok(())
+}
+
+// ---- Processing ----
+
+/// Queues (re)transcription of a meeting. `cpu` forces the CPU backend for this run.
+#[tauri::command]
+pub fn transcribe_meeting(app: AppHandle, id: i64, cpu: bool) -> Result<(), String> {
+    if models::selected(&app).is_none() {
+        return Err(
+            "Choose and download a transcription model in Settings → Transcription first.".into(),
+        );
+    }
+    let options = crate::processing::JobOptions {
+        backend: cpu.then_some(earshot_protocol::Backend::Cpu),
+    };
+    crate::processing::enqueue(&app, id, options)
+}
+
+#[tauri::command]
+pub fn cancel_processing(app: AppHandle, id: i64) {
+    app.state::<crate::processing::Processor>().cancel(&app, id);
+}
+
+#[tauri::command]
+pub fn processing_jobs(db: State<'_, Db>) -> Result<Vec<crate::db::JobRow>, String> {
+    db.latest_jobs().map_err(err)
+}
+
+#[tauri::command]
+pub fn get_transcript(db: State<'_, Db>, id: i64) -> Result<Vec<crate::db::UtteranceRow>, String> {
+    db.transcript(id).map_err(err)
 }
 
 // ---- Storage & hotkey ----

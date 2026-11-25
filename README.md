@@ -4,7 +4,7 @@ A fully local meeting recorder and transcriber for Windows and macOS. Records yo
 the meeting audio as separate tracks, transcribes them with Whisper, labels speakers with
 open-source diarization, and can summarize with a local model. Nothing leaves the machine.
 
-> Status: early development. Recording works (mic + meeting audio as separate crash-safe tracks); transcription is next.
+> Status: early development. Recording and transcription work; speaker labels are next.
 
 ## Development
 
@@ -12,8 +12,11 @@ Requirements:
 
 - Node.js 24+
 - Rust (the toolchain pinned in `rust-toolchain.toml` is installed automatically by rustup)
+- CMake and LLVM/libclang (to build whisper.cpp for the transcription worker)
 - Windows: Visual Studio Build Tools with the C++ workload, WebView2 (preinstalled on Windows 11)
 - macOS: Xcode Command Line Tools
+- Optional: NVIDIA CUDA Toolkit for GPU transcription on Windows (detected automatically;
+  `node scripts/build-worker.mjs --cpu` forces a CPU build)
 
 On Windows, double-click `dev.cmd` (or run `npm run tauri:dev`) to start "Earshot Dev" with hot
 reload. It uses its own data folder and never updates itself.
