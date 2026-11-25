@@ -306,16 +306,57 @@ pub fn select_model(app: AppHandle, id: String) -> Result<(), String> {
 
 // ---- Processing ----
 
-/// Queues (re)transcription of a meeting. `cpu` forces the CPU backend for this run.
+/// Queues (re)transcription of a meeting. `cpu` forces the CPU backend for this run; `model`
+/// transcribes with another downloaded model instead of the selected one.
 #[tauri::command]
-pub fn transcribe_meeting(app: AppHandle, id: i64, cpu: bool) -> Result<(), String> {
-    if models::selected(&app).is_none() {
-        return Err(
-            "Choose and download a transcription model in Settings → Transcription first.".into(),
-        );
+pub fn transcribe_meeting(
+    app: AppHandle,
+    id: i64,
+    cpu: bool,
+    model: Option<String>,
+) -> Result<(), String> {
+    match &model {
+        Some(m) => {
+            if !models::find(m)
+                .is_some_and(|m| m.category == "transcription" && models::is_ready(&app, m))
+            {
+                return Err("That model isn't downloaded.".into());
+            }
+        }
+        None if models::selected(&app).is_none() => {
+            return Err(
+                "Choose and download a transcription model in Settings → Transcription first."
+                    .into(),
+            );
+        }
+        None => {}
     }
     let options = crate::processing::JobOptions {
         backend: cpu.then_some(earshot_protocol::Backend::Cpu),
+        model,
+        ..Default::default()
+    };
+    crate::processing::enqueue(&app, id, options)
+}
+
+/// Separates speakers again from the existing transcript, optionally with a known number of
+/// speakers or another sensitivity. Names given to speakers carry over where they clearly match.
+#[tauri::command]
+pub fn separate_speakers(
+    app: AppHandle,
+    id: i64,
+    speaker_count: Option<u32>,
+    sensitivity: Option<f32>,
+) -> Result<(), String> {
+    if models::diarization_models(&app).is_none() {
+        models::download_companions(&app);
+        return Err("The speaker models are still downloading. Try again in a minute.".into());
+    }
+    let options = crate::processing::JobOptions {
+        speakers_only: true,
+        speaker_count: speaker_count.filter(|&n| (1..=20).contains(&n)),
+        sensitivity: sensitivity.map(|s| s.clamp(0.0, 100.0)),
+        ..Default::default()
     };
     crate::processing::enqueue(&app, id, options)
 }
@@ -328,6 +369,220 @@ pub fn cancel_processing(app: AppHandle, id: i64) {
 #[tauri::command]
 pub fn processing_jobs(db: State<'_, Db>) -> Result<Vec<crate::db::JobRow>, String> {
     db.latest_jobs().map_err(err)
+}
+
+// ---- Speakers and transcript editing ----
+
+#[tauri::command]
+pub fn get_speakers(db: State<'_, Db>, id: i64) -> Result<Vec<crate::db::SpeakerRow>, String> {
+    db.speakers(id).map_err(err)
+}
+
+/// Renames a speaker in one meeting; an empty name goes back to "Speaker N".
+#[tauri::command]
+pub fn rename_speaker(db: State<'_, Db>, id: i64, name: String) -> Result<(), String> {
+    let name: String = name.trim().chars().take(60).collect();
+    db.rename_speaker(id, (!name.is_empty()).then_some(name.as_str()))
+        .map_err(err)
+}
+
+#[tauri::command]
+pub fn merge_speakers(db: State<'_, Db>, from: i64, into: i64) -> Result<(), String> {
+    db.merge_speakers(from, into).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_utterance_speaker(db: State<'_, Db>, id: i64, speaker_id: i64) -> Result<(), String> {
+    db.set_utterance_speaker(id, speaker_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_utterance_text(db: State<'_, Db>, id: i64, text: String) -> Result<(), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("A line can't be empty.".into());
+    }
+    if text.chars().count() > 10_000 {
+        return Err("That line is too long.".into());
+    }
+    db.set_utterance_text(id, text).map_err(err)
+}
+
+// ---- Search, export, delete ----
+
+#[tauri::command]
+pub fn search_transcripts(
+    db: State<'_, Db>,
+    query: String,
+) -> Result<Vec<crate::db::SearchHit>, String> {
+    let query: String = query.chars().take(200).collect();
+    db.search(&query, 200).map_err(err)
+}
+
+fn me_name(db: &Db) -> String {
+    db.get_setting("speakers.meName")
+        .ok()
+        .flatten()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Me".to_owned())
+}
+
+/// Saves the transcript as Markdown, text, SRT, VTT or JSON where the user chooses. `when` (the
+/// meeting's local date and time) and `date` (for the file name) come formatted from the page.
+/// Returns the saved path, or `None` if the dialog was cancelled.
+#[tauri::command]
+pub async fn export_meeting(
+    app: AppHandle,
+    id: i64,
+    format: String,
+    when: String,
+    date: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let format = crate::export::Format::parse(&format).ok_or("unknown export format")?;
+    blocking(move || {
+        let db = app.state::<Db>();
+        let meeting = db.meeting(id).map_err(err)?.ok_or("meeting not found")?;
+        let lines = db.transcript(id).map_err(err)?;
+        let me = me_name(&db);
+        let doc = crate::export::Doc {
+            meeting: &meeting,
+            lines: &lines,
+            me_name: &me,
+            when: when.chars().take(100).collect(),
+        };
+        let content = crate::export::render(&doc, format);
+        let date: String = date
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '-')
+            .take(10)
+            .collect();
+        let name = format!(
+            "{}.{}",
+            crate::export::file_stem(&meeting, &date),
+            format.extension()
+        );
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_title("Export transcript")
+            .set_file_name(&name)
+            .add_filter(format.label(), &[format.extension()])
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let path = path.into_path().map_err(err)?;
+        std::fs::write(&path, content)
+            .map_err(|e| format!("Couldn't save {}: {e}", path.display()))?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await
+}
+
+/// Copies the meeting's audio tracks (FLAC) into a folder the user picks.
+#[tauri::command]
+pub async fn export_audio(app: AppHandle, id: i64, date: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    blocking(move || {
+        let db = app.state::<Db>();
+        let meeting = db.meeting(id).map_err(err)?.ok_or("meeting not found")?;
+        let tracks = db.tracks(id).map_err(err)?;
+        if tracks.is_empty() {
+            return Err("This meeting has no audio.".into());
+        }
+        let Some(dir) = app
+            .dialog()
+            .file()
+            .set_title("Export audio to folder")
+            .blocking_pick_folder()
+        else {
+            return Ok(None);
+        };
+        let dir = dir.into_path().map_err(err)?;
+        let date: String = date
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '-')
+            .take(10)
+            .collect();
+        let stem = crate::export::file_stem(&meeting, &date);
+        let me = me_name(&db);
+        for t in tracks {
+            let who = if t.kind == "mic" {
+                me.as_str()
+            } else {
+                "Meeting"
+            };
+            let who: String = who
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ')
+                .collect();
+            let target = dir.join(format!("{stem} - {who}.flac"));
+            std::fs::copy(&t.path, &target)
+                .map_err(|e| format!("Couldn't copy to {}: {e}", target.display()))?;
+        }
+        Ok(Some(dir.display().to_string()))
+    })
+    .await
+}
+
+/// Permanently deletes a meeting: its audio files, transcript and speakers.
+#[tauri::command]
+pub fn delete_meeting(app: AppHandle, id: i64) -> Result<(), String> {
+    if app.state::<Recorder>().state().meeting_id == Some(id) {
+        return Err("Stop the recording before deleting this meeting.".into());
+    }
+    app.state::<crate::processing::Processor>().cancel(&app, id);
+    let paths = app.state::<Db>().delete_meeting(id).map_err(err)?;
+    for p in &paths {
+        let path = std::path::Path::new(p);
+        if let Err(e) = std::fs::remove_file(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("couldn't delete {}: {e}", path.display());
+        }
+        // Remove the meeting's own folder once it's empty (never a non-empty or shared one).
+        if let Some(dir) = path.parent()
+            && dir.file_name().and_then(|n| n.to_str()) == Some(&format!("meeting-{id}"))
+        {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+    log::info!("meeting {id} deleted");
+    let _ = app.emit(crate::processing::EVENT_CHANGED, id);
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackAudio {
+    kind: String,
+    path: String,
+    duration_ms: i64,
+    /// Where the recording came from ("Default system audio", a device or an app).
+    source: Option<String>,
+}
+
+/// The meeting's audio files for the player. Only these files are opened to the webview (the
+/// asset protocol scope starts empty), so pages can't read anything else on disk.
+#[tauri::command]
+pub fn meeting_audio(app: AppHandle, id: i64) -> Result<Vec<TrackAudio>, String> {
+    let tracks = app.state::<Db>().tracks(id).map_err(err)?;
+    let scope = app.asset_protocol_scope();
+    let mut out = Vec::new();
+    for t in tracks.into_iter().filter(|t| t.finalized) {
+        if !std::path::Path::new(&t.path).is_file() {
+            continue;
+        }
+        scope.allow_file(&t.path).map_err(err)?;
+        out.push(TrackAudio {
+            kind: t.kind,
+            path: t.path,
+            duration_ms: t.duration_ms,
+            source: t.source,
+        });
+    }
+    Ok(out)
 }
 
 #[tauri::command]

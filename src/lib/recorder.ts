@@ -55,6 +55,9 @@ export interface Meeting {
   error: string | null;
   remoteSpeakerCountHint: number | null;
   tags: string[];
+  language: string | null;
+  /** Remote speakers by name (or "Speaker N"), most talkative first. */
+  speakers: string[];
 }
 
 export interface Interrupted {

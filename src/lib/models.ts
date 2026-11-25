@@ -62,6 +62,8 @@ export interface Utterance {
   speakerLabel: string | null;
   speakerName: string | null;
   isMe: boolean;
+  /** Corrected by hand; word timings may not match the text any more. */
+  edited: boolean;
   startMs: number;
   endMs: number;
   text: string;
@@ -77,7 +79,8 @@ export const models = {
 };
 
 export const processing = {
-  transcribe: (id: number, cpu = false) => invoke<void>("transcribe_meeting", { id, cpu }),
+  transcribe: (id: number, cpu = false, model: string | null = null) =>
+    invoke<void>("transcribe_meeting", { id, cpu, model }),
   cancel: (id: number) => invoke<void>("cancel_processing", { id }),
   jobs: () => invoke<Job[]>("processing_jobs"),
   transcript: (id: number) => invoke<Utterance[]>("get_transcript", { id }),

@@ -36,7 +36,11 @@
         "form-action": "'none'",
         "frame-ancestors": "'none'"
       },
-      "freezePrototype": true
+      "freezePrototype": true,
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
     },
     "macOSPrivateApi": true
   },

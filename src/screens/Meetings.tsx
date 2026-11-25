@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Circle, Headphones, Pause, Play, Square, X } from "lucide-react";
+import { AlertTriangle, Circle, Headphones, Pause, Play, Search, Square, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SearchResults } from "@/components/SearchResults";
 import { parseSavedSource, SourceSelect } from "@/components/SourceSelect";
 import { processing, useModels, useProcessing, type Job } from "@/lib/models";
 import { ipc } from "@/lib/ipc";
@@ -27,9 +28,10 @@ export function Meetings({
   onOpen,
   onSetupTranscription,
 }: {
-  onOpen: (id: number) => void;
+  onOpen: (id: number, atMs?: number) => void;
   onSetupTranscription: () => void;
 }) {
+  const [query, setQuery] = useState("");
   const state = useRecorderState();
   const { jobs, live, refresh: refreshJobs } = useProcessing();
   const { info: modelsInfo } = useModels();
@@ -97,7 +99,23 @@ export function Meetings({
       )}
 
       {meetings && meetings.length > 0 && (
-        <ul className="mt-6 divide-y divide-border border-t border-border" aria-label="Meetings">
+        <div className="relative mt-6">
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+          <Input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search meetings and transcripts"
+            aria-label="Search meetings and transcripts"
+            className="pl-8"
+          />
+        </div>
+      )}
+
+      {meetings && query.trim() && <SearchResults query={query} meetings={meetings} onOpen={onOpen} />}
+
+      {meetings && meetings.length > 0 && !query.trim() && (
+        <ul className="mt-4 divide-y divide-border border-t border-border" aria-label="Meetings">
           {meetings
             .filter((m) => m.status !== "recording")
             .map((m) => (
@@ -347,6 +365,18 @@ function MeetingRow({
           {m.durationMs > 0 && ` · ${formatDuration(m.durationMs)}`}
           {m.tags.length > 0 && ` · ${m.tags.join(", ")}`}
         </div>
+        {m.speakers.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1" aria-label="Speakers">
+            {m.speakers.slice(0, 4).map((s) => (
+              <span key={s} className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                {s}
+              </span>
+            ))}
+            {m.speakers.length > 4 && (
+              <span className="px-1 py-0.5 text-xs text-muted-foreground">+{m.speakers.length - 4}</span>
+            )}
+          </div>
+        )}
         {m.error && (
           <div
             className={`mt-1 text-xs whitespace-pre-line ${m.status === "failed" || m.status === "incomplete" ? "text-destructive" : "text-muted-foreground"}`}

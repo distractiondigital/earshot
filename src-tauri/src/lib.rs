@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod export;
 mod hotkey;
 mod models;
 mod pill;
@@ -92,9 +93,20 @@ pub fn run() {
             commands::delete_model,
             commands::select_model,
             commands::transcribe_meeting,
+            commands::separate_speakers,
             commands::cancel_processing,
             commands::processing_jobs,
             commands::get_transcript,
+            commands::meeting_audio,
+            commands::search_transcripts,
+            commands::export_meeting,
+            commands::export_audio,
+            commands::delete_meeting,
+            commands::get_speakers,
+            commands::rename_speaker,
+            commands::merge_speakers,
+            commands::set_utterance_speaker,
+            commands::set_utterance_text,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Earshot");

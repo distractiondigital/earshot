@@ -34,6 +34,10 @@ pub struct MeetingRow {
     pub error: Option<String>,
     pub remote_speaker_count_hint: Option<i64>,
     pub tags: Vec<String>,
+    /// Detected or chosen language (ISO 639-1).
+    pub language: Option<String>,
+    /// Remote speakers by name (or "Speaker N"), most talkative first, for the list's chips.
+    pub speakers: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -65,6 +69,8 @@ pub struct NewSpeaker {
     /// "Me" or "Speaker N".
     pub label: String,
     pub is_me: bool,
+    /// Name carried over from before a re-run.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,6 +92,8 @@ pub struct UtteranceRow {
     /// Name given by the user (M4).
     pub speaker_name: Option<String>,
     pub is_me: bool,
+    /// The text was corrected by hand; word timings may no longer match it.
+    pub edited: bool,
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
@@ -117,8 +125,50 @@ pub struct TrackRow {
     pub source_spec: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerRow {
+    pub id: i64,
+    /// "Me" or "Speaker N".
+    pub label: String,
+    /// Name given by the user.
+    pub name: Option<String>,
+    pub is_me: bool,
+    pub talk_ms: i64,
+    pub utterances: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub meeting_id: i64,
+    pub utterance_id: i64,
+    pub start_ms: i64,
+    /// Matching text with matches between \u{1} and \u{2}.
+    pub snippet: String,
+}
+
+/// Turns what the user typed into a safe FTS5 query: every word quoted (so punctuation and
+/// operators are plain text) and matched as a prefix. `None` when there's nothing to search for.
+fn fts_query(input: &str) -> Option<String> {
+    let terms: Vec<String> = input
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .take(12)
+        .map(|w| format!("\"{}\"*", w.replace('"', "")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[error("{0}")]
+    Invalid(&'static str),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("migration error: {0}")]
@@ -425,10 +475,11 @@ impl Db {
         tx.execute("DELETE FROM speakers WHERE meeting_id = ?1", [meeting_id])?;
         let mut ids = Vec::with_capacity(speakers.len());
         {
-            let mut ins_s =
-                tx.prepare("INSERT INTO speakers (meeting_id, label, is_me) VALUES (?1, ?2, ?3)")?;
+            let mut ins_s = tx.prepare(
+                "INSERT INTO speakers (meeting_id, label, is_me, display_name) VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for sp in speakers {
-                ins_s.execute(params![meeting_id, sp.label, sp.is_me])?;
+                ins_s.execute(params![meeting_id, sp.label, sp.is_me, sp.name])?;
                 ids.push(tx.last_insert_rowid());
             }
             let mut ins_u = tx.prepare(
@@ -469,12 +520,207 @@ impl Db {
         Ok(())
     }
 
+    /// A meeting's speakers with how long each one talks.
+    pub fn speakers(&self, meeting_id: i64) -> Result<Vec<SpeakerRow>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT s.id, s.label, s.display_name, s.is_me,
+                    coalesce(sum(u.end_ms - u.start_ms), 0), count(u.id)
+             FROM speakers s LEFT JOIN utterances u ON u.speaker_id = s.id
+             WHERE s.meeting_id = ?1
+             GROUP BY s.id
+             ORDER BY s.is_me DESC, s.id",
+        )?;
+        let rows = stmt
+            .query_map([meeting_id], |r| {
+                Ok(SpeakerRow {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    name: r.get(2)?,
+                    is_me: r.get::<_, i64>(3)? != 0,
+                    talk_ms: r.get(4)?,
+                    utterances: r.get(5)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Sets (or with `None`, clears) the name shown for a speaker.
+    pub fn rename_speaker(&self, speaker_id: i64, name: Option<&str>) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE speakers SET display_name = ?2 WHERE id = ?1",
+            params![speaker_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Moves every utterance of `from` to `into` and removes `from`. Both must belong to the
+    /// same meeting, and the mic speaker ("Me") can't be merged away.
+    pub fn merge_speakers(&self, from: i64, into: i64) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let ok: bool = tx.query_row(
+            "SELECT count(*) = 2 AND sum(is_me AND id = ?1) = 0 AND count(DISTINCT meeting_id) = 1
+             FROM speakers WHERE id IN (?1, ?2)",
+            params![from, into],
+            |r| r.get(0),
+        )?;
+        if !ok || from == into {
+            return Err(DbError::Invalid("those speakers can't be merged"));
+        }
+        tx.execute(
+            "UPDATE utterances SET speaker_id = ?2 WHERE speaker_id = ?1",
+            params![from, into],
+        )?;
+        tx.execute("DELETE FROM speakers WHERE id = ?1", [from])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Gives one utterance to another speaker of the same meeting.
+    pub fn set_utterance_speaker(&self, utterance_id: i64, speaker_id: i64) -> Result<(), DbError> {
+        let n = self.conn().execute(
+            "UPDATE utterances SET speaker_id = ?2
+             WHERE id = ?1
+               AND meeting_id = (SELECT meeting_id FROM speakers WHERE id = ?2)",
+            params![utterance_id, speaker_id],
+        )?;
+        if n == 0 {
+            return Err(DbError::Invalid("that speaker isn't in this meeting"));
+        }
+        Ok(())
+    }
+
+    /// Replaces an utterance's text (a hand correction); search follows via the FTS trigger.
+    pub fn set_utterance_text(&self, utterance_id: i64, text: &str) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE utterances SET text = ?2, edited = 1 WHERE id = ?1",
+            params![utterance_id, text],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored word of a meeting per track, in time order (for re-running speaker separation
+    /// without transcribing again).
+    pub fn track_words(&self, meeting_id: i64) -> Result<Vec<(String, Vec<NewWord>)>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT u.track_kind, w.start_ms, w.end_ms, w.text, w.prob
+             FROM words w JOIN utterances u ON u.id = w.utterance_id
+             WHERE u.meeting_id = ?1
+             ORDER BY u.track_kind, w.start_ms, w.id",
+        )?;
+        let mut out: Vec<(String, Vec<NewWord>)> = Vec::new();
+        let rows = stmt.query_map([meeting_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                NewWord {
+                    start_ms: r.get(1)?,
+                    end_ms: r.get(2)?,
+                    text: r.get(3)?,
+                    prob: r.get::<_, Option<f64>>(4)?.unwrap_or(0.0) as f32,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (kind, w) = row?;
+            match out.last_mut() {
+                Some((k, ws)) if *k == kind => ws.push(w),
+                _ => out.push((kind, vec![w])),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remote speakers the user named, with when they spoke (to carry names over a re-run).
+    pub fn named_speakers(
+        &self,
+        meeting_id: i64,
+    ) -> Result<Vec<crate::speakers::OldSpeaker>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT s.id, s.display_name, u.start_ms, u.end_ms
+             FROM speakers s JOIN utterances u ON u.speaker_id = s.id
+             WHERE s.meeting_id = ?1 AND s.is_me = 0 AND s.display_name IS NOT NULL
+             ORDER BY s.id, u.start_ms",
+        )?;
+        let mut out: Vec<(i64, crate::speakers::OldSpeaker)> = Vec::new();
+        let rows = stmt.query_map([meeting_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, name, s, e) = row?;
+            match out.last_mut() {
+                Some((last, o)) if *last == id => o.spans.push((s, e)),
+                _ => out.push((
+                    id,
+                    crate::speakers::OldSpeaker {
+                        name,
+                        spans: vec![(s, e)],
+                    },
+                )),
+            }
+        }
+        Ok(out.into_iter().map(|(_, o)| o).collect())
+    }
+
+    /// Full-text search over every transcript, newest meetings first. Each word of `query` must
+    /// appear (as a word prefix). Snippets mark matches with \u{1} … \u{2}.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, DbError> {
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT u.meeting_id, u.id, u.start_ms,
+                    snippet(utterances_fts, 0, char(1), char(2), '…', 14)
+             FROM utterances_fts
+             JOIN utterances u ON u.id = utterances_fts.rowid
+             JOIN meetings m ON m.id = u.meeting_id
+             WHERE utterances_fts MATCH ?1
+             ORDER BY m.started_at DESC, u.start_ms
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![fts, limit as i64], |r| {
+                Ok(SearchHit {
+                    meeting_id: r.get(0)?,
+                    utterance_id: r.get(1)?,
+                    start_ms: r.get(2)?,
+                    snippet: r.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes a meeting and everything attached to it; returns its track files to remove.
+    pub fn delete_meeting(&self, id: i64) -> Result<Vec<String>, DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let paths = {
+            let mut stmt = tx.prepare("SELECT path FROM tracks WHERE meeting_id = ?1")?;
+            stmt.query_map([id], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        // Utterances, words, speakers, tracks and jobs go with it (ON DELETE CASCADE).
+        tx.execute("DELETE FROM meetings WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(paths)
+    }
+
     /// All utterances of a meeting in time order, with their words.
     pub fn transcript(&self, meeting_id: i64) -> Result<Vec<UtteranceRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT u.id, u.track_kind, u.start_ms, u.end_ms, u.text,
-                    u.speaker_id, s.label, s.display_name, coalesce(s.is_me, 0)
+                    u.speaker_id, s.label, s.display_name, coalesce(s.is_me, 0), u.edited
              FROM utterances u LEFT JOIN speakers s ON s.id = u.speaker_id
              WHERE u.meeting_id = ?1
              ORDER BY u.start_ms, u.id",
@@ -491,6 +737,7 @@ impl Db {
                     speaker_label: r.get(6)?,
                     speaker_name: r.get(7)?,
                     is_me: r.get::<_, i64>(8)? != 0,
+                    edited: r.get::<_, i64>(9)? != 0,
                     words: Vec::new(),
                 })
             })?
@@ -524,11 +771,19 @@ impl Db {
     pub fn list_meetings(&self) -> Result<Vec<MeetingRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT id, title, started_at, duration_ms, status, error, remote_speaker_count_hint, tags
-             FROM meetings ORDER BY started_at DESC",
+            "SELECT m.id, m.title, m.started_at, m.duration_ms, m.status, m.error,
+                    m.remote_speaker_count_hint, m.tags, m.language,
+                    (SELECT json_group_array(name) FROM (
+                        SELECT coalesce(s.display_name, s.label) AS name
+                        FROM speakers s LEFT JOIN utterances u ON u.speaker_id = s.id
+                        WHERE s.meeting_id = m.id AND s.is_me = 0
+                        GROUP BY s.id
+                        ORDER BY coalesce(sum(u.end_ms - u.start_ms), 0) DESC))
+             FROM meetings m ORDER BY m.started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             let tags: String = r.get(7)?;
+            let speakers: Option<String> = r.get(9)?;
             Ok(MeetingRow {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -538,6 +793,10 @@ impl Db {
                 error: r.get(5)?,
                 remote_speaker_count_hint: r.get(6)?,
                 tags: serde_json::from_str(&tags).unwrap_or_default(),
+                language: r.get(8)?,
+                speakers: speakers
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -580,6 +839,268 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speaker_editing() {
+        let db = Db::open_in_memory().unwrap();
+        let m = db.create_meeting(1_000, "a").unwrap();
+        let other = db.create_meeting(2_000, "b").unwrap();
+        let word = |s: i64, t: &str| NewWord {
+            start_ms: s,
+            end_ms: s + 400,
+            text: format!(" {t}"),
+            prob: 0.9,
+        };
+        let utt = |speaker: usize, s: i64, t: &str| NewUtterance {
+            speaker: Some(speaker),
+            start_ms: s,
+            end_ms: s + 400,
+            text: t.into(),
+            words: vec![word(s, t)],
+        };
+        let speakers = [
+            NewSpeaker {
+                label: "Speaker 1".into(),
+                is_me: false,
+                name: None,
+            },
+            NewSpeaker {
+                label: "Speaker 2".into(),
+                is_me: false,
+                name: None,
+            },
+            NewSpeaker {
+                label: "Me".into(),
+                is_me: true,
+                name: None,
+            },
+        ];
+        db.save_transcript(
+            m,
+            &speakers,
+            &[
+                (
+                    "system",
+                    &[
+                        utt(0, 0, "alpha"),
+                        utt(1, 1000, "bravo"),
+                        utt(0, 2000, "charlie"),
+                    ],
+                ),
+                ("mic", &[utt(2, 3000, "delta")]),
+            ],
+        )
+        .unwrap();
+        db.save_transcript(
+            other,
+            &speakers[..1],
+            &[("system", &[utt(0, 0, "elsewhere")])],
+        )
+        .unwrap();
+        let sp = db.speakers(m).unwrap();
+        assert_eq!(
+            sp.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            ["Me", "Speaker 1", "Speaker 2"]
+        );
+        let (me, s1, s2) = (sp[0].id, sp[1].id, sp[2].id);
+        assert_eq!((sp[1].utterances, sp[1].talk_ms), (2, 800));
+        let foreign = db.speakers(other).unwrap()[0].id;
+
+        db.rename_speaker(s1, Some("Dana")).unwrap();
+        assert_eq!(
+            db.transcript(m).unwrap()[0].speaker_name.as_deref(),
+            Some("Dana")
+        );
+
+        // The mic speaker can't be merged away, and speakers of different meetings can't merge.
+        assert!(db.merge_speakers(me, s1).is_err());
+        assert!(db.merge_speakers(s2, foreign).is_err());
+        db.merge_speakers(s2, s1).unwrap();
+        let sp = db.speakers(m).unwrap();
+        assert_eq!(sp.len(), 2);
+        assert_eq!(sp[1].utterances, 3);
+
+        // Reassigning one line, only within the meeting.
+        let t = db.transcript(m).unwrap();
+        let bravo = t.iter().find(|u| u.text == "bravo").unwrap().id;
+        db.set_utterance_speaker(bravo, me).unwrap();
+        assert!(db.set_utterance_speaker(bravo, foreign).is_err());
+        assert!(
+            db.transcript(m)
+                .unwrap()
+                .iter()
+                .find(|u| u.id == bravo)
+                .unwrap()
+                .is_me
+        );
+
+        // Edited text is marked and searchable.
+        db.set_utterance_text(bravo, "bravo corrected").unwrap();
+        let u = db
+            .transcript(m)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.id == bravo)
+            .unwrap();
+        assert!(u.edited);
+        let hits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM utterances_fts WHERE utterances_fts MATCH 'corrected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn stored_words_and_named_speakers_for_reruns() {
+        let db = Db::open_in_memory().unwrap();
+        let m = db.create_meeting(1_000, "a").unwrap();
+        let u = |speaker: usize, s: i64, words: &[&str]| NewUtterance {
+            speaker: Some(speaker),
+            start_ms: s,
+            end_ms: s + 300 * words.len() as i64,
+            text: words.join(" "),
+            words: words
+                .iter()
+                .enumerate()
+                .map(|(i, w)| NewWord {
+                    start_ms: s + 300 * i as i64,
+                    end_ms: s + 300 * (i as i64 + 1),
+                    text: format!(" {w}"),
+                    prob: 0.5,
+                })
+                .collect(),
+        };
+        let speakers = [
+            NewSpeaker {
+                label: "Speaker 1".into(),
+                is_me: false,
+                name: Some("Dana".into()),
+            },
+            NewSpeaker {
+                label: "Speaker 2".into(),
+                is_me: false,
+                name: None,
+            },
+            NewSpeaker {
+                label: "Me".into(),
+                is_me: true,
+                name: None,
+            },
+        ];
+        db.save_transcript(
+            m,
+            &speakers,
+            &[
+                (
+                    "system",
+                    &[u(0, 0, &["a", "b"]), u(1, 5000, &["c"]), u(0, 9000, &["d"])],
+                ),
+                ("mic", &[u(2, 2000, &["e", "f"])]),
+            ],
+        )
+        .unwrap();
+        let words = db.track_words(m).unwrap();
+        let summary: Vec<(String, Vec<String>)> = words
+            .iter()
+            .map(|(k, ws)| {
+                (
+                    k.clone(),
+                    ws.iter().map(|w| w.text.trim().to_owned()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("mic".to_owned(), vec!["e".to_owned(), "f".to_owned()]),
+                (
+                    "system".to_owned(),
+                    vec!["a".into(), "b".into(), "c".into(), "d".into()]
+                ),
+            ]
+        );
+        let named = db.named_speakers(m).unwrap();
+        assert_eq!(named.len(), 1, "unnamed and 'Me' speakers are left out");
+        assert_eq!(named[0].name, "Dana");
+        assert_eq!(named[0].spans, [(0, 600), (9000, 9300)]);
+    }
+
+    #[test]
+    fn search_and_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.create_meeting(1_000, "older").unwrap();
+        let b = db.create_meeting(2_000, "newer").unwrap();
+        let u = |s: i64, t: &str| NewUtterance {
+            speaker: None,
+            start_ms: s,
+            end_ms: s + 1000,
+            text: t.into(),
+            words: Vec::new(),
+        };
+        db.save_transcript(
+            a,
+            &[],
+            &[(
+                "system",
+                &[u(5_000, "The budget review moved to Thursday.")],
+            )],
+        )
+        .unwrap();
+        db.save_transcript(
+            b,
+            &[],
+            &[(
+                "system",
+                &[u(9_000, "Budgets are due; budget-wise we're fine.")],
+            )],
+        )
+        .unwrap();
+        db.add_track(
+            a,
+            "system",
+            "C:/rec/meeting-a/system.flac",
+            48_000,
+            2,
+            "Default system audio",
+            None,
+        )
+        .unwrap();
+
+        let hits = db.search("budg", 50).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.meeting_id).collect::<Vec<_>>(),
+            [b, a],
+            "newest first"
+        );
+        assert!(
+            hits[1].snippet.contains("\u{1}budget\u{2}"),
+            "{:?}",
+            hits[1].snippet
+        );
+        assert_eq!(
+            db.search("budget thursday", 50).unwrap().len(),
+            1,
+            "all words must match"
+        );
+        // Operators and quotes are plain text, not query syntax.
+        assert!(db.search("\" OR * NEAR( -", 50).is_ok());
+        assert!(db.search("   ", 50).unwrap().is_empty());
+
+        assert_eq!(
+            db.delete_meeting(a).unwrap(),
+            ["C:/rec/meeting-a/system.flac"]
+        );
+        assert!(db.meeting(a).unwrap().is_none());
+        assert!(
+            db.search("thursday", 50).unwrap().is_empty(),
+            "search index follows deletes"
+        );
+        assert_eq!(db.search("budget", 50).unwrap().len(), 1);
+    }
 
     #[test]
     fn migrations_are_valid() {
@@ -734,10 +1255,12 @@ mod tests {
             NewSpeaker {
                 label: "Speaker 1".into(),
                 is_me: false,
+                name: None,
             },
             NewSpeaker {
                 label: "Me".into(),
                 is_me: true,
+                name: None,
             },
         ];
         let mut sys = utt(500, "welcome");

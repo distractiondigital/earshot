@@ -18,6 +18,8 @@ const NAV: { id: Screen; label: string; icon: typeof Users }[] = [
 export default function App() {
   const [screen, setScreen] = useState<Screen>("meetings");
   const [openMeeting, setOpenMeeting] = useState<number | null>(null);
+  // Where to start playback when a meeting is opened from a search result.
+  const [openAt, setOpenAt] = useState<number | undefined>(undefined);
   const [settingsTab, setSettingsTab] = useState("general");
   const go = (s: Screen) => {
     setScreen(s);
@@ -50,7 +52,10 @@ export default function App() {
         <main className="flex-1 overflow-y-auto">
           {screen === "meetings" && openMeeting === null && (
             <Meetings
-              onOpen={setOpenMeeting}
+              onOpen={(id, atMs) => {
+                setOpenAt(atMs);
+                setOpenMeeting(id);
+              }}
               onSetupTranscription={() => {
                 setScreen("settings");
                 setSettingsTab("transcription");
@@ -58,7 +63,7 @@ export default function App() {
             />
           )}
           {screen === "meetings" && openMeeting !== null && (
-            <MeetingView id={openMeeting} onBack={() => setOpenMeeting(null)} />
+            <MeetingView id={openMeeting} startAtMs={openAt} onBack={() => setOpenMeeting(null)} />
           )}
           {screen === "speakers" && <Speakers />}
           {screen === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} />}

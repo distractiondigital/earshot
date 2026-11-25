@@ -19,7 +19,7 @@ use earshot_protocol::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::db::{Db, NewSpeaker, NewUtterance};
+use crate::db::{Db, NewSpeaker, NewUtterance, NewWord};
 use crate::{models, speakers};
 
 pub const EVENT_PROGRESS: &str = "processing://progress";
@@ -32,6 +32,18 @@ const JOB_KIND: &str = "transcribe";
 pub struct JobOptions {
     /// Force a backend for this run ("cpu" after a GPU problem).
     pub backend: Option<Backend>,
+    /// Transcribe with this model instead of the selected one.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Keep the transcript and only separate speakers again.
+    #[serde(default)]
+    pub speakers_only: bool,
+    /// Known number of remote speakers for this run (overrides the meeting's hint).
+    #[serde(default)]
+    pub speaker_count: Option<u32>,
+    /// Sensitivity 0–100 for this run (overrides the setting).
+    #[serde(default)]
+    pub sensitivity: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,9 +213,21 @@ fn run_job(
         log::error!("processing meeting {meeting_id} failed: {msg}");
     };
 
-    let Some(model) = models::selected(app) else {
-        fail("Choose and download a transcription model in Settings → Transcription.");
-        return;
+    let model = match &options.model {
+        Some(id) => {
+            models::find(id).filter(|m| m.category == "transcription" && models::is_ready(app, m))
+        }
+        None => models::selected(app),
+    };
+    let model = match model {
+        Some(m) => m,
+        None if options.speakers_only => models::vad_model(), // unused: nothing is transcribed
+        None if options.model.is_some() => {
+            return fail("That transcription model isn't downloaded any more. Pick another one.");
+        }
+        None => {
+            return fail("Choose and download a transcription model in Settings → Transcription.");
+        }
     };
     let vad = models::vad_model();
     let vad_path = models::is_ready(app, vad)
@@ -236,7 +260,23 @@ fn run_job(
         ))
     });
     let system_track = tracks.iter().find(|t| t.kind == "system").cloned();
-    let steps = tracks.len() + usize::from(system_track.is_some() && diarize_models.is_some());
+    if options.speakers_only {
+        if system_track.is_none() {
+            return fail("This meeting has no meeting audio to separate speakers in.");
+        }
+        if diarize_models.is_none() {
+            models::download_companions(app);
+            return fail("The speaker models are still downloading. Try again in a minute.");
+        }
+    }
+    let transcribe_steps = if options.speakers_only {
+        0
+    } else {
+        tracks.len()
+    };
+    let steps = transcribe_steps + usize::from(system_track.is_some() && diarize_models.is_some());
+    // Names the user gave speakers, to carry over to this run's speakers.
+    let old_names = db.named_speakers(meeting_id).unwrap_or_default();
 
     *current.lock().unwrap() = Some(Current {
         meeting_id,
@@ -251,7 +291,15 @@ fn run_job(
     let mut backend = options.backend.unwrap_or_else(|| configured_backend(&db));
     let mut notes = Vec::new();
     let mut language_found = None;
-    let mut transcripts: Vec<(String, Transcript)> = Vec::new();
+    // Each track's words: freshly transcribed, or the stored ones when only separating speakers.
+    let mut track_words: Vec<(String, Vec<NewWord>)> = if options.speakers_only {
+        match db.track_words(meeting_id) {
+            Ok(w) => w,
+            Err(e) => return fail(&e.to_string()),
+        }
+    } else {
+        Vec::new()
+    };
     let was_cancelled = || {
         current
             .lock()
@@ -261,11 +309,22 @@ fn run_job(
     };
     let on_cancel = || {
         let _ = db.update_job(job_id, "cancelled", None, 0.0, None);
-        let _ = db.set_meeting_status(meeting_id, "queued", None, None);
+        // A cancelled re-run of speaker separation leaves the existing transcript in place.
+        let status = if options.speakers_only {
+            "ready"
+        } else {
+            "queued"
+        };
+        let _ = db.set_meeting_status(meeting_id, status, None, None);
         log::info!("processing meeting {meeting_id} cancelled");
     };
 
-    for (i, track) in tracks.iter().enumerate() {
+    let to_transcribe = if options.speakers_only {
+        &tracks[..0]
+    } else {
+        &tracks[..]
+    };
+    for (i, track) in to_transcribe.iter().enumerate() {
         let mut attempt = 0;
         let transcript = loop {
             attempt += 1;
@@ -348,7 +407,7 @@ fn run_job(
         if let Err(e) = db.replace_track_transcript(meeting_id, &track.kind, &plain) {
             return fail(&format!("saving the transcript failed: {e}"));
         }
-        transcripts.push((track.kind.clone(), transcript));
+        track_words.push((track.kind.clone(), words));
     }
 
     // Who spoke when, on the meeting track.
@@ -365,11 +424,18 @@ fn run_job(
             audio_path: track.path.clone(),
             segmentation_model_path: seg.to_string_lossy().into_owned(),
             embedding_model_path: emb.to_string_lossy().into_owned(),
-            num_speakers: hint.map(|n| n as u32),
-            threshold: clustering_threshold(&db, models::embedding_choice(app)),
+            num_speakers: options
+                .speaker_count
+                .filter(|&n| n > 0)
+                .or(hint.map(|n| n as u32)),
+            threshold: clustering_threshold(
+                &db,
+                models::embedding_choice(app),
+                options.sensitivity,
+            ),
         };
         let step = Step {
-            index: tracks.len(),
+            index: transcribe_steps,
             count: steps,
             track_kind: &track.kind,
         };
@@ -418,7 +484,21 @@ fn run_job(
         speakers: speaker_rows,
         tracks: final_tracks,
         removed,
-    } = assemble(&transcripts, diarization.as_ref());
+    } = assemble(&track_words, diarization.as_ref());
+    let mut speaker_rows = speaker_rows;
+    if !old_names.is_empty() {
+        let spans: Vec<(Option<usize>, i64, i64)> = final_tracks
+            .iter()
+            .filter(|(k, _)| k == "system")
+            .flat_map(|(_, us)| us.iter().map(|u| (u.speaker, u.start_ms, u.end_ms)))
+            .collect();
+        let names = speakers::carry_names(&old_names, &spans, speaker_rows.len());
+        for (row, name) in speaker_rows.iter_mut().zip(names) {
+            if !row.is_me {
+                row.name = name;
+            }
+        }
+    }
     if removed > 0 {
         log::info!("removed {removed} mic utterance(s) that echoed the meeting audio");
     }
@@ -445,12 +525,14 @@ fn run_job(
 /// Default for Settings → Speakers → sensitivity (0–100).
 pub const DEFAULT_SENSITIVITY: f32 = 50.0;
 
-fn clustering_threshold(db: &Db, embedding: &models::CatalogModel) -> f32 {
-    let s = db
-        .get_setting("speakers.sensitivity")
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<f32>().ok())
+fn clustering_threshold(db: &Db, embedding: &models::CatalogModel, run: Option<f32>) -> f32 {
+    let s = run
+        .or_else(|| {
+            db.get_setting("speakers.sensitivity")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f32>().ok())
+        })
         .unwrap_or(DEFAULT_SENSITIVITY)
         .clamp(0.0, 100.0);
     sensitivity_to_threshold(s, embedding.cluster_threshold.unwrap_or(0.5))
@@ -475,24 +557,24 @@ struct Assembled {
     removed: usize,
 }
 
-fn assemble(transcripts: &[(String, Transcript)], diarization: Option<&Diarization>) -> Assembled {
+fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>) -> Assembled {
     let mut rows = Vec::new();
     let mut out = Vec::new();
-    let system = transcripts.iter().find(|(k, _)| k == "system");
-    let system_words = system.map(|(_, t)| speakers::words(t)).unwrap_or_default();
+    let system = tracks.iter().find(|(k, _)| k == "system");
+    let system_words: &[NewWord] = system.map(|(_, w)| w.as_slice()).unwrap_or_default();
 
     let mut system_utts = Vec::new();
     if system.is_some() {
         let labels = match diarization {
             Some(d) if !d.turns.is_empty() => {
-                let mut l = speakers::assign(&system_words, &d.turns);
+                let mut l = speakers::assign(system_words, &d.turns);
                 speakers::smooth(&mut l);
                 l
             }
             // Nothing to separate, or separation failed: speaker unknown.
             _ => vec![None; system_words.len()],
         };
-        let mut grouped = speakers::group(&system_words, &labels);
+        let mut grouped = speakers::group(system_words, &labels);
         let n = speakers::renumber(&mut grouped);
         system_utts = grouped
             .into_iter()
@@ -504,25 +586,26 @@ fn assemble(transcripts: &[(String, Transcript)], diarization: Option<&Diarizati
         rows.extend((1..=n).map(|i| NewSpeaker {
             label: format!("Speaker {i}"),
             is_me: false,
+            name: None,
         }));
     }
 
     let mut removed = 0;
-    if let Some((_, t)) = transcripts.iter().find(|(k, _)| k == "mic") {
-        let words = speakers::words(t);
+    if let Some((_, words)) = tracks.iter().find(|(k, _)| k == "mic") {
         let me = rows.len();
         rows.push(NewSpeaker {
             label: "Me".into(),
             is_me: true,
+            name: None,
         });
-        let mut mic: Vec<NewUtterance> = speakers::group(&words, &vec![None; words.len()])
+        let mut mic: Vec<NewUtterance> = speakers::group(words, &vec![None; words.len()])
             .into_iter()
             .map(|(_, mut u)| {
                 u.speaker = Some(me);
                 u
             })
             .collect();
-        removed = speakers::drop_bleed(&mut mic, &system_words);
+        removed = speakers::drop_bleed(&mut mic, system_words);
         out.push(("mic".to_owned(), mic));
     }
     if system.is_some() {
@@ -748,7 +831,13 @@ mod tests {
             speakers: rows,
             tracks,
             removed,
-        } = assemble(&[("mic".into(), mic), ("system".into(), system)], Some(&d));
+        } = assemble(
+            &[
+                ("mic".into(), speakers::words(&mic)),
+                ("system".into(), speakers::words(&system)),
+            ],
+            Some(&d),
+        );
         assert_eq!(removed, 0);
         assert_eq!(
             rows.iter()
@@ -774,7 +863,7 @@ mod tests {
             speakers: rows,
             tracks,
             ..
-        } = assemble(&[("system".into(), system)], None);
+        } = assemble(&[("system".into(), speakers::words(&system))], None);
         assert!(rows.is_empty());
         assert_eq!(tracks[0].1[0].speaker, None);
     }
@@ -830,7 +919,7 @@ mod tests {
             let Event::Result { transcript, .. } = ev else {
                 panic!("{ev:?}")
             };
-            transcripts.push((kind.to_owned(), transcript));
+            transcripts.push((kind.to_owned(), speakers::words(&transcript)));
         }
         let threshold = std::env::var("EARSHOT_E2E_THRESHOLD")
             .ok()

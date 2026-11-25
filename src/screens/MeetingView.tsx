@@ -1,85 +1,107 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowLeft, Pencil, RotateCw } from "lucide-react";
+import { ArrowLeft, Pencil } from "lucide-react";
+import { MeetingMenu } from "@/components/MeetingMenu";
+import { PlayerBar } from "@/components/PlayerBar";
+import { RerunMenu } from "@/components/RerunMenu";
+import { SpeakersPanel } from "@/components/SpeakersPanel";
+import { Transcript } from "@/components/Transcript";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { ipc } from "@/lib/ipc";
+import { meeting as meetingApi, useSyncedPlayer, type Speaker, type TrackAudio } from "@/lib/meeting";
 import { processing, useProcessing, type Utterance } from "@/lib/models";
 import { formatDuration, recorder, type Meeting } from "@/lib/recorder";
 import { DetailsDialog } from "@/screens/Meetings";
 import { DEFAULT_ME_NAME } from "@/screens/SpeakersSettings";
 
-/** Distinct, readable label colours for remote speakers (light and dark themes). */
-const SPEAKER_COLORS = [
-  "text-sky-700 dark:text-sky-300",
-  "text-amber-700 dark:text-amber-300",
-  "text-emerald-700 dark:text-emerald-300",
-  "text-rose-700 dark:text-rose-300",
-  "text-violet-700 dark:text-violet-300",
-  "text-teal-700 dark:text-teal-300",
-  "text-orange-700 dark:text-orange-300",
-  "text-fuchsia-700 dark:text-fuchsia-300",
-];
+const NO_TRACKS: TrackAudio[] = [];
 
-function speakerColor(u: Utterance) {
-  if (u.isMe) return "text-foreground";
-  const n = Number(/(\d+)$/.exec(u.speakerLabel ?? "")?.[1]);
-  return Number.isFinite(n) && n > 0 ? SPEAKER_COLORS[(n - 1) % SPEAKER_COLORS.length] : "text-muted-foreground";
+/** True when a key press belongs to a text field or control rather than the page. */
+function typingInto(target: EventTarget | null) {
+  const el = target instanceof HTMLElement ? target : null;
+  return !!el?.closest("input, textarea, select, [contenteditable='true'], [role='slider'], [role='menu'], [role='dialog']");
 }
 
-function speakerName(u: Utterance, meName: string) {
-  if (u.isMe) return meName;
-  return u.speakerName ?? u.speakerLabel ?? (u.trackKind === "mic" ? meName : "Meeting");
-}
-
-function stamp(ms: number) {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = String(s % 60).padStart(2, "0");
-  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
-}
-
-/** Read-only transcript of one meeting (the full player arrives with M4). */
-export function MeetingView({ id, onBack }: { id: number; onBack: () => void }) {
+/** One meeting: player, transcript with speakers, and editing. */
+export function MeetingView({ id, onBack, startAtMs }: { id: number; onBack: () => void; startAtMs?: number }) {
   const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [lines, setLines] = useState<Utterance[] | null>(null);
+  const [speakers, setSpeakers] = useState<Speaker[]>([]);
+  const [tracks, setTracks] = useState<TrackAudio[]>(NO_TRACKS);
   const [editing, setEditing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [meName, setMeName] = useState(DEFAULT_ME_NAME);
   const { jobs, live } = useProcessing();
+  const player = useSyncedPlayer(tracks);
 
   useEffect(() => {
     ipc.getSetting("speakers.meName").then((v) => v && setMeName(v));
   }, []);
+
+  const loadTranscript = useCallback(() => {
+    processing.transcript(id).then(setLines).catch((e) => setError(String(e)));
+    meetingApi.speakers(id).then(setSpeakers).catch((e) => setError(String(e)));
+  }, [id]);
 
   const load = useCallback(() => {
     recorder
       .meetings()
       .then((all) => setMeeting(all.find((m) => m.id === id) ?? null))
       .catch((e) => setError(String(e)));
-    processing.transcript(id).then(setLines).catch((e) => setError(String(e)));
-  }, [id]);
+    loadTranscript();
+  }, [id, loadTranscript]);
 
   useEffect(() => {
     load();
+    meetingApi.audio(id).then(setTracks).catch((e) => setError(String(e)));
     const un = listen<number>("processing://changed", (e) => e.payload === id && load());
     return () => {
       un.then((f) => f());
     };
   }, [id, load]);
 
+  // Opened from a search result: jump to that moment once both the audio and the transcript are
+  // loaded (the transcript scrolls to the line when the player reports the new time).
+  const hasLines = !!lines?.length;
+  useEffect(() => {
+    if (startAtMs != null && tracks.length && hasLines) player.seek(startAtMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startAtMs, tracks, hasLines]);
+
+  // Space plays/pauses; arrows skip 5 s (10 s with Shift).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (typingInto(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key === " " && !(e.target instanceof HTMLButtonElement)) {
+        e.preventDefault();
+        if (player.playing) player.pause();
+        else player.play();
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const step = (e.shiftKey ? 10_000 : 5_000) * (e.key === "ArrowLeft" ? -1 : 1);
+        player.seek(player.timeMs + step);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [player]);
+
   const job = jobs[id];
   const running = meeting?.status === "processing" || job?.status === "running" || job?.status === "queued";
   const pct = live?.meetingId === id ? live.pct : (job?.progress ?? 0);
   const date = meeting ? new Date(meeting.startedAt) : null;
+  const onError = (e: string) => setError(e);
 
   return (
-    <div className="mx-auto max-w-3xl p-8">
-      <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2">
-        <ArrowLeft aria-hidden />
-        Meetings
-      </Button>
+    <div className="mx-auto max-w-5xl px-8 pb-8">
+      <div className="pt-8">
+        <Button variant="ghost" size="sm" onClick={onBack} className="-ml-2">
+          <ArrowLeft aria-hidden />
+          Meetings
+        </Button>
+      </div>
 
       {meeting && date && (
         <header className="mt-3 flex items-start gap-4">
@@ -96,26 +118,43 @@ export function MeetingView({ id, onBack }: { id: number; onBack: () => void }) 
             Edit details
           </Button>
           {!running && meeting.status !== "incomplete" && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                processing
-                  .transcribe(id)
-                  .then(load)
-                  .catch((e) => setError(String(e)))
-              }
-            >
-              <RotateCw aria-hidden />
-              {lines?.length ? "Transcribe again" : "Transcribe"}
-            </Button>
+            <RerunMenu
+              id={id}
+              hasTranscript={!!lines?.length}
+              hasEdits={!!lines?.some((u) => u.edited)}
+              speakerHint={meeting.remoteSpeakerCountHint}
+              onQueued={load}
+              onError={onError}
+            />
           )}
+          <MeetingMenu
+            meeting={meeting}
+            hasTranscript={!!lines?.length}
+            hasAudio={tracks.length > 0}
+            onDeleted={onBack}
+            onDone={(msg) => {
+              setError(null);
+              setNotice(msg);
+            }}
+            onError={onError}
+          />
         </header>
+      )}
+
+      {tracks.length > 0 && (
+        <div className="sticky top-0 z-10 -mx-2 mt-4 bg-background px-2 py-2">
+          <PlayerBar player={player} tracks={tracks} lines={lines ?? []} meName={meName} />
+        </div>
       )}
 
       {error && (
         <p className="mt-4 text-sm text-destructive" role="alert">
           {error}
+        </p>
+      )}
+      {notice && !error && (
+        <p className="mt-4 truncate text-sm text-muted-foreground" role="status" title={notice}>
+          {notice}
         </p>
       )}
 
@@ -130,22 +169,24 @@ export function MeetingView({ id, onBack }: { id: number; onBack: () => void }) 
 
       {meeting?.error && <p className="mt-4 text-sm text-muted-foreground">{meeting.error}</p>}
 
-      {lines && lines.length === 0 && !running && (
-        <p className="mt-8 text-sm text-muted-foreground">No transcript yet.</p>
-      )}
+      {lines && lines.length === 0 && !running && <p className="mt-8 text-sm text-muted-foreground">No transcript yet.</p>}
 
       {lines && lines.length > 0 && (
-        <ol className="mt-6 space-y-3 select-text" aria-label="Transcript">
-          {lines.map((u) => (
-            <li key={u.id} className="grid grid-cols-[3.5rem_7rem_1fr] gap-2 text-sm">
-              <span className="text-muted-foreground tabular-nums">{stamp(u.startMs)}</span>
-              <span className={`truncate font-medium ${speakerColor(u)}`} title={speakerName(u, meName)}>
-                {speakerName(u, meName)}
-              </span>
-              <span>{u.text}</span>
-            </li>
-          ))}
-        </ol>
+        <div className="mt-4 grid gap-6 lg:grid-cols-[1fr_15rem]">
+          <Transcript
+            lines={lines}
+            speakers={speakers}
+            meName={meName}
+            player={tracks.length ? player : null}
+            onChanged={loadTranscript}
+            onError={onError}
+          />
+          <aside className="order-first lg:order-last">
+            <div className="lg:sticky lg:top-36">
+              <SpeakersPanel speakers={speakers} meName={meName} onChanged={loadTranscript} onError={onError} />
+            </div>
+          </aside>
+        </div>
       )}
 
       {editing && meeting && (

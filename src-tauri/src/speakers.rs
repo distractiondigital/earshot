@@ -132,6 +132,52 @@ pub fn renumber(utterances: &mut [(Option<u32>, NewUtterance)]) -> usize {
     order.len()
 }
 
+/// A speaker from before a re-run: the name the user gave it and when it spoke.
+pub struct OldSpeaker {
+    pub name: String,
+    pub spans: Vec<(i64, i64)>,
+}
+
+/// Carries user-given names over to the speakers of a re-run. A new speaker inherits an old
+/// speaker's name only when each is the other's best match by overlapping speech, and the match
+/// covers at least half of the new speaker's talk time; anything less clean stays "Speaker N".
+/// `new` is (0-based new speaker index, start ms, end ms) for each new utterance.
+pub fn carry_names(
+    old: &[OldSpeaker],
+    new: &[(Option<usize>, i64, i64)],
+    new_count: usize,
+) -> Vec<Option<String>> {
+    let mut overlap = vec![vec![0i64; old.len()]; new_count];
+    let mut talk = vec![0i64; new_count];
+    for &(label, start, end) in new {
+        let Some(i) = label.filter(|&i| i < new_count) else {
+            continue;
+        };
+        talk[i] += end - start;
+        for (j, o) in old.iter().enumerate() {
+            for &(s, e) in &o.spans {
+                overlap[i][j] += (end.min(e) - start.max(s)).max(0);
+            }
+        }
+    }
+    let best_old = |i: usize| {
+        (0..old.len())
+            .max_by_key(|&j| overlap[i][j])
+            .filter(|&j| overlap[i][j] > 0)
+    };
+    let best_new = |j: usize| {
+        (0..new_count)
+            .max_by_key(|&i| overlap[i][j])
+            .filter(|&i| overlap[i][j] > 0)
+    };
+    (0..new_count)
+        .map(|i| {
+            let j = best_old(i)?;
+            (best_new(j) == Some(i) && overlap[i][j] * 2 >= talk[i]).then(|| old[j].name.clone())
+        })
+        .collect()
+}
+
 fn tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|t| {
@@ -285,6 +331,35 @@ mod tests {
             u.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
             [Some(0), Some(1), Some(0)]
         );
+    }
+
+    #[test]
+    fn names_carry_over_only_on_clean_matches() {
+        let old = [
+            OldSpeaker {
+                name: "Dana".into(),
+                spans: vec![(0, 10_000), (30_000, 40_000)],
+            },
+            OldSpeaker {
+                name: "Lee".into(),
+                spans: vec![(10_000, 20_000)],
+            },
+        ];
+        // New run: cluster 1 is Dana's speech, cluster 0 is Lee's, cluster 2 is a new voice
+        // that only grazes Dana's time.
+        let new = [
+            (Some(1), 0, 10_000),
+            (Some(0), 10_000, 20_000),
+            (Some(1), 30_000, 40_000),
+            (Some(2), 39_000, 50_000),
+        ];
+        assert_eq!(
+            carry_names(&old, &new, 3),
+            [Some("Lee".to_owned()), Some("Dana".to_owned()), None]
+        );
+        // Two old speakers merged into one new cluster: only the bigger name carries over.
+        let merged = [(Some(0), 0, 20_000), (Some(0), 30_000, 40_000)];
+        assert_eq!(carry_names(&old, &merged, 1), [Some("Dana".to_owned())]);
     }
 
     #[test]
