@@ -20,3 +20,6 @@ whisper-rs = { version = "=0.16.0", features = ["log_backend"] }
 symphonia = { version = "=0.6.1", default-features = false, features = ["flac"] }
 rubato = { version = "=5.1.0", default-features = false, features = ["fft_resampler"] }
 audioadapter-buffers = "=5.2.0"
+# Speaker diarization. Links a prebuilt static library that scripts/build-worker.mjs downloads,
+# verifies and passes in through SHERPA_ONNX_LIB_DIR.
+sherpa-onnx-sys = { version = "=2.0.3", default-features = false, features = ["static"] }

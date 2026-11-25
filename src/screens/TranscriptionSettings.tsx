@@ -176,7 +176,7 @@ function Dots({ value, label }: { value: number; label: string }) {
   );
 }
 
-function ModelCard({
+export function ModelCard({
   model: m,
   downloaded,
   error,

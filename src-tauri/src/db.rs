@@ -52,10 +52,19 @@ pub struct JobRow {
 /// One utterance to store: a run of words on one track without a long pause.
 #[derive(Debug, Clone, Default)]
 pub struct NewUtterance {
+    /// Index into the speakers passed to [`Db::save_transcript`].
+    pub speaker: Option<usize>,
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
     pub words: Vec<NewWord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewSpeaker {
+    /// "Me" or "Speaker N".
+    pub label: String,
+    pub is_me: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -71,6 +80,12 @@ pub struct NewWord {
 pub struct UtteranceRow {
     pub id: i64,
     pub track_kind: String,
+    pub speaker_id: Option<i64>,
+    /// "Me" or "Speaker N"; `None` when the speaker isn't known.
+    pub speaker_label: Option<String>,
+    /// Name given by the user (M4).
+    pub speaker_name: Option<String>,
+    pub is_me: bool,
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
@@ -397,6 +412,55 @@ impl Db {
         Ok(())
     }
 
+    /// Replaces a meeting's speakers and its whole transcript in one transaction.
+    pub fn save_transcript(
+        &self,
+        meeting_id: i64,
+        speakers: &[NewSpeaker],
+        tracks: &[(&str, &[NewUtterance])],
+    ) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM utterances WHERE meeting_id = ?1", [meeting_id])?;
+        tx.execute("DELETE FROM speakers WHERE meeting_id = ?1", [meeting_id])?;
+        let mut ids = Vec::with_capacity(speakers.len());
+        {
+            let mut ins_s =
+                tx.prepare("INSERT INTO speakers (meeting_id, label, is_me) VALUES (?1, ?2, ?3)")?;
+            for sp in speakers {
+                ins_s.execute(params![meeting_id, sp.label, sp.is_me])?;
+                ids.push(tx.last_insert_rowid());
+            }
+            let mut ins_u = tx.prepare(
+                "INSERT INTO utterances (meeting_id, speaker_id, track_kind, start_ms, end_ms, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut ins_w = tx.prepare(
+                "INSERT INTO words (utterance_id, start_ms, end_ms, text, prob) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (kind, utterances) in tracks {
+                for u in *utterances {
+                    let speaker_id = u.speaker.and_then(|i| ids.get(i).copied());
+                    ins_u.execute(params![
+                        meeting_id, speaker_id, kind, u.start_ms, u.end_ms, u.text
+                    ])?;
+                    let uid = tx.last_insert_rowid();
+                    for w in &u.words {
+                        ins_w.execute(params![
+                            uid,
+                            w.start_ms,
+                            w.end_ms,
+                            w.text,
+                            f64::from(w.prob)
+                        ])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_meeting_language(&self, id: i64, language: &str) -> Result<(), DbError> {
         self.conn().execute(
             "UPDATE meetings SET language = ?2 WHERE id = ?1",
@@ -409,8 +473,11 @@ impl Db {
     pub fn transcript(&self, meeting_id: i64) -> Result<Vec<UtteranceRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT id, track_kind, start_ms, end_ms, text FROM utterances WHERE meeting_id = ?1
-             ORDER BY start_ms, id",
+            "SELECT u.id, u.track_kind, u.start_ms, u.end_ms, u.text,
+                    u.speaker_id, s.label, s.display_name, coalesce(s.is_me, 0)
+             FROM utterances u LEFT JOIN speakers s ON s.id = u.speaker_id
+             WHERE u.meeting_id = ?1
+             ORDER BY u.start_ms, u.id",
         )?;
         let mut out: Vec<UtteranceRow> = stmt
             .query_map([meeting_id], |r| {
@@ -420,6 +487,10 @@ impl Db {
                     start_ms: r.get(2)?,
                     end_ms: r.get(3)?,
                     text: r.get(4)?,
+                    speaker_id: r.get(5)?,
+                    speaker_label: r.get(6)?,
+                    speaker_name: r.get(7)?,
+                    is_me: r.get::<_, i64>(8)? != 0,
                     words: Vec::new(),
                 })
             })?
@@ -625,6 +696,7 @@ mod tests {
         assert_eq!(db.next_queued_job().unwrap().unwrap().status, "queued");
 
         let utt = |s: i64, text: &str| NewUtterance {
+            speaker: None,
             start_ms: s,
             end_ms: s + 500,
             text: text.into(),
@@ -656,5 +728,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fts, 0, "replaced text is gone from search");
+
+        // The final save replaces speakers and both tracks together.
+        let speakers = [
+            NewSpeaker {
+                label: "Speaker 1".into(),
+                is_me: false,
+            },
+            NewSpeaker {
+                label: "Me".into(),
+                is_me: true,
+            },
+        ];
+        let mut sys = utt(500, "welcome");
+        sys.speaker = Some(0);
+        let mut mine = utt(900, "thanks");
+        mine.speaker = Some(1);
+        let unknown = utt(4000, "mystery");
+        db.save_transcript(
+            m,
+            &speakers,
+            &[("system", &[sys, unknown]), ("mic", &[mine])],
+        )
+        .unwrap();
+        let t = db.transcript(m).unwrap();
+        assert_eq!(
+            t.iter()
+                .map(|u| (u.text.as_str(), u.speaker_label.as_deref(), u.is_me))
+                .collect::<Vec<_>>(),
+            [
+                ("welcome", Some("Speaker 1"), false),
+                ("thanks", Some("Me"), true),
+                ("mystery", None, false)
+            ]
+        );
+        // Saving again replaces speakers rather than adding more.
+        db.save_transcript(m, &speakers, &[]).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM speakers WHERE meeting_id = ?1",
+                [m],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(db.transcript(m).unwrap().is_empty());
     }
 }

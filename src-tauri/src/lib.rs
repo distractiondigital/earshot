@@ -5,6 +5,7 @@ mod models;
 mod pill;
 mod processing;
 mod recorder;
+mod speakers;
 mod tray;
 mod worker;
 
@@ -49,6 +50,11 @@ pub fn run() {
             app.manage(processor);
             tray::build(app.handle())?;
             hotkey::register_saved(app.handle());
+            // Speaker models arrived after some transcription models were downloaded (M3):
+            // fetch the small helper models for anyone who already set up transcription.
+            if models::selected(app.handle()).is_some() {
+                models::download_companions(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

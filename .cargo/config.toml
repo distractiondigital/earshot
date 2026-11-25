@@ -1,0 +1,5 @@
+# sherpa-onnx (speaker diarization in earshot-worker) links a prebuilt library that
+# scripts/build-worker.mjs downloads, verifies and extracts here. Run `npm run build:worker` once
+# before plain cargo commands (clippy, tests) that compile the worker.
+[env]
+SHERPA_ONNX_LIB_DIR = { value = "target/sherpa-onnx-archives/host/lib", relative = true }

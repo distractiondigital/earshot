@@ -11,6 +11,7 @@ import { ipc, type AppInfo, type Theme } from "@/lib/ipc";
 import { useTheme } from "@/lib/theme";
 import { useUpdates } from "@/lib/updates";
 import { RecordingSettings } from "@/screens/RecordingSettings";
+import { SpeakersSettings } from "@/screens/SpeakersSettings";
 import { TranscriptionSettings } from "@/screens/TranscriptionSettings";
 
 export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => void }) {
@@ -22,6 +23,7 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="recording">Recording</TabsTrigger>
           <TabsTrigger value="transcription">Transcription</TabsTrigger>
+          <TabsTrigger value="speakers">Speakers</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
         <TabsContent value="general" className="pt-4">
@@ -32,6 +34,9 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
         </TabsContent>
         <TabsContent value="transcription" className="pt-4">
           <TranscriptionSettings />
+        </TabsContent>
+        <TabsContent value="speakers" className="pt-4">
+          <SpeakersSettings />
         </TabsContent>
         <TabsContent value="about" className="pt-4">
           <About />

@@ -4,7 +4,8 @@ A fully local meeting recorder and transcriber for Windows and macOS. Records yo
 the meeting audio as separate tracks, transcribes them with Whisper, labels speakers with
 open-source diarization, and can summarize with a local model. Nothing leaves the machine.
 
-> Status: early development. Recording and transcription work; speaker labels are next.
+> Status: early development. Recording, transcription and speaker labels work; the meeting player
+> and speaker editing are next.
 
 ## Development
 
@@ -21,9 +22,15 @@ Requirements:
 On Windows, double-click `dev.cmd` (or run `npm run tauri:dev`) to start "Earshot Dev" with hot
 reload. It uses its own data folder and never updates itself.
 
+The worker links sherpa-onnx (speaker labels) as a prebuilt library. `npm run build:worker`
+downloads it from the sherpa-onnx GitHub release, checks its SHA-256 and extracts it under
+`target/`; run it once before plain `cargo` commands (`cargo test`, `cargo clippy`) that build the
+worker.
+
 ```sh
 npm ci
 npm run tauri:dev      # run "Earshot Dev" with hot reload (separate data folder, no updater)
+npm run build:worker   # build the worker sidecar (tauri:dev does this too)
 cargo test --workspace # Rust tests
 ```
 

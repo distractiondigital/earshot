@@ -5,6 +5,7 @@
 //! on stdout. Diagnostics go to stderr. The worker exits when stdin closes.
 
 mod audio;
+mod diarize;
 mod transcribe;
 mod vad;
 
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
-use earshot_protocol::{ErrorCode, Event, Request};
+use earshot_protocol::{ErrorCode, Event, Request, Stage};
 
 /// Messages for the stdout writer thread.
 enum Out {
@@ -68,41 +69,58 @@ fn handle(
             }
             None
         }
-        Request::Transcribe { id, job } => {
-            let mut slot = running.lock().unwrap();
-            if slot.is_some() {
-                let _ = out.send(Out::from(error(
-                    id,
-                    ErrorCode::BadRequest,
-                    "a job is already running",
-                )));
-                return None;
-            }
-            let cancel = Arc::new(AtomicBool::new(false));
-            *slot = Some(Running {
-                id,
-                cancel: cancel.clone(),
-            });
-            drop(slot);
-            let (out, running) = (out.clone(), running.clone());
-            Some(std::thread::spawn(move || {
-                let progress_out = out.clone();
-                let result = transcribe::run(&job, &cancel, move |stage, pct| {
-                    let _ = progress_out.send(Out::from(Event::Progress { id, stage, pct }));
-                });
-                *running.lock().unwrap() = None;
-                let _ = out.send(Out::from(match result {
-                    Ok(transcript) => Event::Result { id, transcript },
-                    Err(e) => Event::Error {
-                        id,
-                        code: e.code,
-                        message: e.message,
-                        suggestion: e.suggestion,
-                    },
-                }));
-            }))
-        }
+        Request::Transcribe { id, job } => start(id, out, running, move |cancel, progress| {
+            transcribe::run(&job, cancel, progress)
+                .map(|transcript| Event::Result { id, transcript })
+        }),
+        Request::Diarize { id, job } => start(id, out, running, move |cancel, progress| {
+            diarize::run(&job, cancel, progress)
+                .map(|diarization| Event::Diarization { id, diarization })
+        }),
     }
+}
+
+type Progress = Box<dyn FnMut(Stage, f32) + Send>;
+
+/// Runs a job on its own thread; only one job runs at a time.
+fn start(
+    id: u64,
+    out: &Sender<Out>,
+    running: &Arc<Mutex<Option<Running>>>,
+    work: impl FnOnce(&Arc<AtomicBool>, Progress) -> Result<Event, transcribe::JobError>
+    + Send
+    + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    let mut slot = running.lock().unwrap();
+    if slot.is_some() {
+        let _ = out.send(Out::from(error(
+            id,
+            ErrorCode::BadRequest,
+            "a job is already running",
+        )));
+        return None;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    *slot = Some(Running {
+        id,
+        cancel: cancel.clone(),
+    });
+    drop(slot);
+    let (out, running) = (out.clone(), running.clone());
+    Some(std::thread::spawn(move || {
+        let progress_out = out.clone();
+        let progress: Progress = Box::new(move |stage, pct| {
+            let _ = progress_out.send(Out::from(Event::Progress { id, stage, pct }));
+        });
+        let result = work(&cancel, progress);
+        *running.lock().unwrap() = None;
+        let _ = out.send(Out::from(result.unwrap_or_else(|e| Event::Error {
+            id,
+            code: e.code,
+            message: e.message,
+            suggestion: e.suggestion,
+        })));
+    }))
 }
 
 fn main() -> io::Result<()> {

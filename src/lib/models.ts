@@ -13,7 +13,7 @@ export interface Hardware {
 
 export interface ModelView {
   id: string;
-  category: "transcription" | "vad";
+  category: "transcription" | "vad" | "segmentation" | "embedding";
   name: string;
   description: string;
   sizeBytes: number;
@@ -50,13 +50,18 @@ export interface ProcessingProgress {
   track: number;
   tracks: number;
   trackKind: string;
-  stage: "decode" | "vad" | "load_model" | "transcribe";
+  stage: "decode" | "vad" | "load_model" | "transcribe" | "diarize";
   pct: number;
 }
 
 export interface Utterance {
   id: number;
   trackKind: "mic" | "system";
+  speakerId: number | null;
+  /** "Me" or "Speaker N"; null when the speaker isn't known. */
+  speakerLabel: string | null;
+  speakerName: string | null;
+  isMe: boolean;
   startMs: number;
   endMs: number;
   text: string;

@@ -14,6 +14,11 @@ pub enum Request {
         id: u64,
         job: TranscribeJob,
     },
+    /// Splits a track into speaker turns ("who spoke when").
+    Diarize {
+        id: u64,
+        job: DiarizeJob,
+    },
     /// Cancels the running job with this id (it ends with an `Error { code: Cancelled }`).
     Cancel {
         id: u64,
@@ -45,6 +50,20 @@ pub struct TranscribeJob {
     pub dtw_preset: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiarizeJob {
+    /// FLAC track written by the recorder.
+    pub audio_path: String,
+    /// pyannote segmentation ONNX model.
+    pub segmentation_model_path: String,
+    /// Speaker-embedding ONNX model.
+    pub embedding_model_path: String,
+    /// Known number of speakers; `None` lets `threshold` decide.
+    pub num_speakers: Option<u32>,
+    /// Clustering distance threshold used when the count is unknown. Larger -> fewer speakers.
+    pub threshold: f32,
+}
+
 /// Worker -> app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -65,6 +84,11 @@ pub enum Event {
         id: u64,
         transcript: Transcript,
     },
+    /// Result of a `Diarize` request.
+    Diarization {
+        id: u64,
+        diarization: Diarization,
+    },
     Error {
         id: u64,
         code: ErrorCode,
@@ -82,6 +106,8 @@ pub enum Stage {
     Vad,
     LoadModel,
     Transcribe,
+    /// Separating speakers.
+    Diarize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +119,7 @@ pub enum ErrorCode {
     /// The GPU backend failed to initialise or run (retry on CPU).
     GpuFailed,
     TranscribeFailed,
+    DiarizeFailed,
     Cancelled,
 }
 
@@ -124,12 +151,30 @@ pub struct Word {
     pub prob: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Diarization {
+    pub audio_ms: u64,
+    pub elapsed_ms: u64,
+    pub num_speakers: u32,
+    /// Sorted by start time. Turns of different speakers may overlap.
+    pub turns: Vec<SpeakerTurn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerTurn {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// 0-based cluster index, stable only within one result.
+    pub speaker: u32,
+}
+
 impl Event {
     pub fn id(&self) -> u64 {
         match self {
             Event::Pong { id, .. }
             | Event::Progress { id, .. }
             | Event::Result { id, .. }
+            | Event::Diarization { id, .. }
             | Event::Error { id, .. } => *id,
         }
     }

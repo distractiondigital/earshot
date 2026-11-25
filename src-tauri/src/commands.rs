@@ -37,9 +37,18 @@ const SETTINGS: &[(&str, Option<&[&str]>)] = &[
     ("transcription.language", None),
     ("transcription.backend", Some(&["auto", "gpu", "cpu"])),
     ("transcription.autoProcess", Some(&["true", "false"])),
+    // 0–100; validated in check_setting.
+    ("speakers.sensitivity", None),
+    // Name shown for the mic track's speaker.
+    ("speakers.meName", None),
 ];
 /// Readable but only changed through dedicated commands.
-const READ_ONLY_SETTINGS: &[&str] = &["recording.dir", "recording.hotkey", "transcription.model"];
+const READ_ONLY_SETTINGS: &[&str] = &[
+    "recording.dir",
+    "recording.hotkey",
+    "transcription.model",
+    "speakers.embeddingModel",
+];
 
 pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String> {
     if value.is_none() && READ_ONLY_SETTINGS.contains(&key) {
@@ -55,6 +64,18 @@ pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String
         && serde_json::from_str::<capture::SystemSource>(v).is_err()
     {
         return Err(format!("invalid meeting audio source: {v}"));
+    }
+    if key == "speakers.sensitivity"
+        && let Some(v) = value
+        && !v.parse::<f32>().is_ok_and(|n| (0.0..=100.0).contains(&n))
+    {
+        return Err(format!("sensitivity must be 0–100: {v}"));
+    }
+    if key == "speakers.meName"
+        && let Some(v) = value
+        && (v.trim().is_empty() || v.chars().count() > 60)
+    {
+        return Err("the name must be 1–60 characters".into());
     }
     match (value, allowed) {
         (Some(v), Some(allowed)) if !allowed.contains(&v) => {
@@ -253,7 +274,7 @@ pub fn download_model(app: AppHandle, id: String) -> Result<(), String> {
     let m = models::find(&id).ok_or("unknown model")?;
     models::download::start(&app, m);
     if m.category == "transcription" {
-        models::download::start(&app, models::vad_model());
+        models::download_companions(&app);
     }
     Ok(())
 }

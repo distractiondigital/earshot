@@ -15,7 +15,8 @@
 // in the main one.
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -83,22 +84,77 @@ if (!forceCpu && triple.includes("apple")) {
 }
 console.log(`earshot-worker: building with ${features.length ? features.join(", ") : "CPU only"}`);
 
+// sherpa-onnx (speaker diarization) links a prebuilt static library. sherpa-onnx-sys would download
+// it at build time without checking it, and on Windows it picks the build that uses the static C
+// runtime (/MT), which can't be linked with whisper.cpp (/MD; its CUDA code ignores /MT). So the
+// library is fetched here, verified against the checksum GitHub publishes for the release, extracted,
+// and handed over through SHERPA_ONNX_LIB_DIR. The host platform's copy lives in a fixed "host"
+// folder, which .cargo/config.toml points plain `cargo` commands (clippy, tests) at.
+// Keep the version in step with the worker's Cargo.toml.
+const SHERPA_VERSION = "2.0.3";
+const SHERPA_ARCHIVES = {
+  "x86_64-pc-windows-msvc": ["win-x64-static-MD-Release", "4187678699067d486950717c1e667b2e9a59aef83106a0e8a12328ffb750adf2"],
+  "aarch64-pc-windows-msvc": ["win-arm64-static-MD-Release", "c9f57aa3a03e43c9efd45f46ccf14bc47eeed1d87f65948993d52ce205b6b0c5"],
+  "aarch64-apple-darwin": ["osx-arm64-static", "c86468ad8f79b679550f0865cc1a67747f58b8cc8780623ed7d8367fd4b541a3"],
+  "x86_64-apple-darwin": ["osx-x64-static", "aa2669f175bc3b496788308e211e1bbb792ca7ba654f79db69bf20bef1d597a0"],
+  "x86_64-unknown-linux-gnu": ["linux-x64-static", "f927e695d29b8c7ea3fda97eed215204b210fd57f9faf990a93377bac098ad57"],
+  "aarch64-unknown-linux-gnu": ["linux-aarch64-static", "11f9860fd4dc18af397a493ee9bcb88d18c6ba1b235fb3041ec1a3ef6522364b"],
+};
+const archiveDir = join(root, "target", "sherpa-onnx-archives");
+
+/** Downloads (if needed), verifies and extracts the sherpa-onnx library; returns its lib directory. */
+async function sherpaLibDir(target) {
+  const entry = SHERPA_ARCHIVES[target];
+  if (!entry) throw new Error(`No pinned sherpa-onnx library for ${target}`);
+  const [kind, sha256] = entry;
+  const stem = `sherpa-onnx-v${SHERPA_VERSION}-${kind}-lib`;
+  const file = join(archiveDir, `${stem}.tar.bz2`);
+  const dir = join(archiveDir, target === hostTriple ? "host" : stem);
+  const libDir = join(dir, "lib");
+  const marker = join(dir, ".verified");
+  if (existsSync(marker) && readFileSync(marker, "utf8") === sha256) return libDir;
+
+  const digest = (buf) => createHash("sha256").update(buf).digest("hex");
+  mkdirSync(archiveDir, { recursive: true });
+  if (!existsSync(file) || digest(readFileSync(file)) !== sha256) {
+    const url = `https://github.com/k2-fsa/sherpa-onnx/releases/download/v${SHERPA_VERSION}/${stem}.tar.bz2`;
+    console.log(`earshot-worker: downloading ${stem}.tar.bz2`);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const got = digest(buf);
+    if (got !== sha256) throw new Error(`Checksum mismatch for ${stem}: expected ${sha256}, got ${got}`);
+    writeFileSync(`${file}.part`, buf);
+    renameSync(`${file}.part`, file);
+  }
+  rmSync(join(archiveDir, stem), { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true });
+  // bsdtar ships with Windows 10+ and macOS; both read bzip2.
+  const tar = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
+  execFileSync(tar, ["-xjf", file, "-C", archiveDir], { stdio: "inherit" });
+  if (dir !== join(archiveDir, stem)) renameSync(join(archiveDir, stem), dir);
+  if (!existsSync(libDir)) throw new Error(`${stem}.tar.bz2 has no lib/ directory`);
+  writeFileSync(marker, sha256);
+  return libDir;
+}
+
 /** Builds for one target (or the host when `target` is undefined) and returns the binary path. */
-function build(target) {
+async function build(target) {
+  const libDir = await sherpaLibDir(target ?? triple);
   const cargoArgs = ["build", "-p", "earshot-worker", "--target-dir", targetDir];
   if (release) cargoArgs.push("--release");
   if (target) cargoArgs.push("--target", target);
   if (features.length) cargoArgs.push("--features", features.join(","));
-  execFileSync("cargo", cargoArgs, { cwd: root, stdio: "inherit", env });
+  execFileSync("cargo", cargoArgs, { cwd: root, stdio: "inherit", env: { ...env, SHERPA_ONNX_LIB_DIR: libDir } });
   return target
     ? join(targetDir, target, profile, `earshot-worker${ext}`)
     : join(targetDir, profile, `earshot-worker${ext}`);
 }
 
 if (triple === "universal-apple-darwin") {
-  const parts = ["aarch64-apple-darwin", "x86_64-apple-darwin"].map(build);
+  const parts = [await build("aarch64-apple-darwin"), await build("x86_64-apple-darwin")];
   execFileSync("lipo", ["-create", "-output", out, ...parts], { stdio: "inherit" });
 } else {
-  copyFileSync(build(explicitTarget), out);
+  copyFileSync(await build(explicitTarget), out);
 }
 console.log(`earshot-worker -> ${out}`);

@@ -20,7 +20,10 @@ lto = true
 strip = true
 
 # whisper.cpp (C++, built by whisper-rs-sys via CMake) and audio decoding are unusably slow
-# unoptimized; optimize them even in dev builds.
+# unoptimized; optimize them even in dev builds. The worker itself too: generic code such as the
+# resampler is compiled into the calling crate, so overriding its library alone doesn't help.
+[profile.dev.package.earshot-worker]
+opt-level = 3
 [profile.dev.package.whisper-rs-sys]
 opt-level = 3
 [profile.dev.package.whisper-rs]
@@ -28,4 +31,22 @@ opt-level = 3
 [profile.dev.package.symphonia-bundle-flac]
 opt-level = 3
 [profile.dev.package.rubato]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+[profile.dev.package.audioadapter]
+opt-level = 3
+[profile.dev.package.audioadapter-buffers]
+opt-level = 3
+[profile.dev.package.symphonia-core]
+opt-level = 3
+[profile.dev.package.num-complex]
+opt-level = 3
+[profile.dev.package.transpose]
+opt-level = 3
+[profile.dev.package.strength_reduce]
+opt-level = 3
+[profile.dev.package.primal-check]
 opt-level = 3

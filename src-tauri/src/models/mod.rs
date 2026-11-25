@@ -15,6 +15,9 @@ use crate::db::Db;
 pub const EVENT_CHANGED: &str = "models://changed";
 pub const EVENT_PROGRESS: &str = "models://progress";
 pub const SELECTED_SETTING: &str = "transcription.model";
+/// Selected speaker-embedding model id.
+pub const EMBEDDING_SETTING: &str = "speakers.embeddingModel";
+pub const DEFAULT_EMBEDDING: &str = "campplus-en-voxceleb";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +39,9 @@ pub struct CatalogModel {
     pub advanced: bool,
     pub badge: Option<String>,
     pub license: String,
+    /// Embedding models: clustering distance threshold at the default sensitivity, tuned on AMI.
+    #[serde(default)]
+    pub cluster_threshold: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +68,41 @@ pub fn vad_model() -> &'static CatalogModel {
         .iter()
         .find(|m| m.category == "vad")
         .expect("catalog has a VAD model")
+}
+
+/// The speaker-segmentation model used for diarization.
+pub fn segmentation_model() -> &'static CatalogModel {
+    catalog()
+        .iter()
+        .find(|m| m.category == "segmentation")
+        .expect("catalog has a segmentation model")
+}
+
+/// The chosen speaker-embedding model (ready or not); the default when nothing valid is set.
+pub fn embedding_choice(app: &AppHandle) -> &'static CatalogModel {
+    app.state::<Db>()
+        .get_setting(EMBEDDING_SETTING)
+        .ok()
+        .flatten()
+        .and_then(|id| find(&id))
+        .filter(|m| m.category == "embedding")
+        .or_else(|| find(DEFAULT_EMBEDDING))
+        .expect("default embedding model exists")
+}
+
+/// Segmentation + embedding models when both are downloaded.
+pub fn diarization_models(
+    app: &AppHandle,
+) -> Option<(&'static CatalogModel, &'static CatalogModel)> {
+    let (seg, emb) = (segmentation_model(), embedding_choice(app));
+    (is_ready(app, seg) && is_ready(app, emb)).then_some((seg, emb))
+}
+
+/// Starts any missing helper models a transcription model needs: VAD and the speaker models.
+pub fn download_companions(app: &AppHandle) {
+    download::start(app, vad_model());
+    download::start(app, segmentation_model());
+    download::start(app, embedding_choice(app));
 }
 
 pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -111,6 +152,7 @@ pub struct ModelView {
 pub fn list(app: &AppHandle, recommended: &str) -> Vec<ModelView> {
     let downloads = app.state::<download::Downloads>();
     let selected_id = selected(app).map(|m| m.id.clone());
+    let embedding_id = embedding_choice(app).id.as_str();
     catalog()
         .iter()
         .map(|m| {
@@ -126,7 +168,8 @@ pub fn list(app: &AppHandle, recommended: &str) -> Vec<ModelView> {
                 model: m.clone(),
                 state,
                 downloaded_bytes: progress.unwrap_or(0),
-                selected: selected_id.as_deref() == Some(m.id.as_str()),
+                selected: selected_id.as_deref() == Some(m.id.as_str())
+                    || (m.category == "embedding" && m.id == embedding_id),
                 recommended: m.id == recommended,
             }
         })
@@ -135,11 +178,16 @@ pub fn list(app: &AppHandle, recommended: &str) -> Vec<ModelView> {
 
 pub fn select(app: &AppHandle, id: &str) -> Result<(), String> {
     let m = find(id).ok_or("unknown model")?;
-    if m.category != "transcription" || !is_ready(app, m) {
+    let key = match m.category.as_str() {
+        "transcription" => SELECTED_SETTING,
+        "embedding" => EMBEDDING_SETTING,
+        _ => return Err(format!("{} can't be selected", m.name)),
+    };
+    if !is_ready(app, m) {
         return Err(format!("{} is not downloaded", m.name));
     }
     app.state::<Db>()
-        .set_setting(SELECTED_SETTING, id)
+        .set_setting(key, id)
         .map_err(|e| e.to_string())
 }
 
@@ -155,9 +203,10 @@ pub fn delete(app: &AppHandle, id: &str) -> Result<(), String> {
         }
     }
     let db = app.state::<Db>();
-    if db.get_setting(SELECTED_SETTING).ok().flatten().as_deref() == Some(id) {
-        db.set_setting(SELECTED_SETTING, "")
-            .map_err(|e| e.to_string())?;
+    for key in [SELECTED_SETTING, EMBEDDING_SETTING] {
+        if db.get_setting(key).ok().flatten().as_deref() == Some(id) {
+            db.set_setting(key, "").map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -171,6 +220,19 @@ mod tests {
         let c = catalog();
         assert!(c.iter().filter(|m| m.category == "transcription").count() >= 6);
         assert_eq!(c.iter().filter(|m| m.category == "vad").count(), 1);
+        assert_eq!(c.iter().filter(|m| m.category == "segmentation").count(), 1);
+        assert!(find(DEFAULT_EMBEDDING).is_some_and(|m| m.category == "embedding"));
+        for m in c.iter().filter(|m| m.category == "embedding") {
+            assert!(
+                m.cluster_threshold.is_some_and(|t| t > 0.0),
+                "{} needs a tuned threshold",
+                m.id
+            );
+        }
+        let mut files: Vec<_> = c.iter().map(|m| &m.file).collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(files.len(), c.len(), "duplicate local file names");
         let mut ids: Vec<_> = c.iter().map(|m| &m.id).collect();
         ids.sort();
         ids.dedup();
@@ -182,8 +244,10 @@ mod tests {
                 "{}",
                 m.id
             );
+            assert!(m.url.starts_with("https://huggingface.co/"), "{}", m.id);
+            // The URL's last part is the upstream name; `file` is the local name (may differ).
             assert!(
-                m.url.starts_with("https://huggingface.co/") && m.url.ends_with(&m.file),
+                m.url.ends_with(".bin") || m.url.ends_with(".onnx"),
                 "{}",
                 m.id
             );

@@ -31,14 +31,14 @@ pub struct JobError {
 }
 
 impl JobError {
-    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
             suggestion: None,
         }
     }
-    fn hint(mut self, s: &str) -> Self {
+    pub fn hint(mut self, s: &str) -> Self {
         self.suggestion = Some(s.into());
         self
     }

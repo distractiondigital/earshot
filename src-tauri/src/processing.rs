@@ -13,18 +13,18 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use earshot_protocol::{Backend, ErrorCode, Event, Request, Stage, TranscribeJob, Transcript};
+use earshot_protocol::{
+    Backend, Diarization, DiarizeJob, ErrorCode, Event, Request, Stage, TranscribeJob, Transcript,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::db::{Db, NewUtterance, NewWord};
-use crate::models;
+use crate::db::{Db, NewSpeaker, NewUtterance};
+use crate::{models, speakers};
 
 pub const EVENT_PROGRESS: &str = "processing://progress";
 pub const EVENT_CHANGED: &str = "processing://changed";
 
-/// A pause longer than this starts a new utterance.
-const UTTERANCE_PAUSE_MS: u64 = 1_200;
 const JOB_KIND: &str = "transcribe";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,7 +38,8 @@ pub struct JobOptions {
 #[serde(rename_all = "camelCase")]
 struct Progress {
     meeting_id: i64,
-    /// 0-based index of the track being processed, and how many there are.
+    /// 0-based index of the step being processed (one per track, plus speaker separation),
+    /// and how many there are.
     track: usize,
     tracks: usize,
     track_kind: String,
@@ -174,7 +175,8 @@ fn configured_backend(db: &Db) -> Backend {
 }
 
 enum WorkerOutcome {
-    Done(Transcript),
+    Transcribed(Transcript),
+    Diarized(Diarization),
     /// The worker reported an error.
     Failed {
         code: ErrorCode,
@@ -226,6 +228,16 @@ fn run_job(
         return fail("This meeting has no audio to transcribe.");
     }
 
+    // Speaker separation runs on the meeting track when its models are downloaded.
+    let diarize_models = models::diarization_models(app).and_then(|(seg, emb)| {
+        Some((
+            models::path_of(app, seg).ok()?,
+            models::path_of(app, emb).ok()?,
+        ))
+    });
+    let system_track = tracks.iter().find(|t| t.kind == "system").cloned();
+    let steps = tracks.len() + usize::from(system_track.is_some() && diarize_models.is_some());
+
     *current.lock().unwrap() = Some(Current {
         meeting_id,
         stdin: None,
@@ -239,6 +251,19 @@ fn run_job(
     let mut backend = options.backend.unwrap_or_else(|| configured_backend(&db));
     let mut notes = Vec::new();
     let mut language_found = None;
+    let mut transcripts: Vec<(String, Transcript)> = Vec::new();
+    let was_cancelled = || {
+        current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|c| c.cancelled)
+    };
+    let on_cancel = || {
+        let _ = db.update_job(job_id, "cancelled", None, 0.0, None);
+        let _ = db.set_meeting_status(meeting_id, "queued", None, None);
+        log::info!("processing meeting {meeting_id} cancelled");
+    };
 
     for (i, track) in tracks.iter().enumerate() {
         let mut attempt = 0;
@@ -252,29 +277,27 @@ fn run_job(
                 backend,
                 dtw_preset: model.dtw_preset.clone(),
             };
+            let step = Step {
+                index: i,
+                count: steps,
+                track_kind: &track.kind,
+            };
             let outcome = run_worker(
                 app,
                 job_id,
                 meeting_id,
-                i,
-                tracks.len(),
-                &track.kind,
-                job,
+                step,
+                Request::Transcribe { id: 1, job },
                 current,
             );
-            if current
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|c| c.cancelled)
-            {
-                let _ = db.update_job(job_id, "cancelled", None, 0.0, None);
-                let _ = db.set_meeting_status(meeting_id, "queued", None, None);
-                log::info!("processing meeting {meeting_id} cancelled");
-                return;
+            if was_cancelled() {
+                return on_cancel();
             }
             match outcome {
-                WorkerOutcome::Done(t) => break t,
+                WorkerOutcome::Transcribed(t) => break t,
+                WorkerOutcome::Diarized(_) => {
+                    return fail("The transcription engine sent an unexpected reply.");
+                }
                 WorkerOutcome::Failed {
                     code: ErrorCode::GpuFailed,
                     message,
@@ -316,10 +339,95 @@ fn run_job(
         if track.kind == "system" || language_found.is_none() {
             language_found = Some(transcript.language.clone());
         }
-        let utterances = group_utterances(&transcript);
-        if let Err(e) = db.replace_track_transcript(meeting_id, &track.kind, &utterances) {
+        // Save each track as soon as it's done, so a later failure still leaves a transcript.
+        let words = speakers::words(&transcript);
+        let plain: Vec<_> = speakers::group(&words, &vec![None; words.len()])
+            .into_iter()
+            .map(|(_, u)| u)
+            .collect();
+        if let Err(e) = db.replace_track_transcript(meeting_id, &track.kind, &plain) {
             return fail(&format!("saving the transcript failed: {e}"));
         }
+        transcripts.push((track.kind.clone(), transcript));
+    }
+
+    // Who spoke when, on the meeting track.
+    let mut diarization = None;
+    const NO_SPEAKERS: &str = "Speakers couldn't be told apart in this meeting.";
+    if let (Some(track), Some((seg, emb))) = (&system_track, &diarize_models) {
+        let hint = db
+            .meeting(meeting_id)
+            .ok()
+            .flatten()
+            .and_then(|m| m.remote_speaker_count_hint)
+            .filter(|&n| n > 0);
+        let job = DiarizeJob {
+            audio_path: track.path.clone(),
+            segmentation_model_path: seg.to_string_lossy().into_owned(),
+            embedding_model_path: emb.to_string_lossy().into_owned(),
+            num_speakers: hint.map(|n| n as u32),
+            threshold: clustering_threshold(&db, models::embedding_choice(app)),
+        };
+        let step = Step {
+            index: tracks.len(),
+            count: steps,
+            track_kind: &track.kind,
+        };
+        let outcome = run_worker(
+            app,
+            job_id,
+            meeting_id,
+            step,
+            Request::Diarize { id: 1, job },
+            current,
+        );
+        if was_cancelled() {
+            return on_cancel();
+        }
+        match outcome {
+            WorkerOutcome::Diarized(d) => {
+                log::info!(
+                    "separated {} speaker(s) in meeting {meeting_id}: {:.1} s audio in {:.1} s",
+                    d.num_speakers,
+                    d.audio_ms as f64 / 1000.0,
+                    d.elapsed_ms as f64 / 1000.0
+                );
+                diarization = Some(d);
+            }
+            WorkerOutcome::Failed { message, .. } => {
+                log::error!("speaker separation failed: {message}");
+                notes.push(NO_SPEAKERS.to_owned());
+            }
+            WorkerOutcome::Died(detail) => {
+                log::error!("worker died during speaker separation: {detail}");
+                notes.push(NO_SPEAKERS.to_owned());
+            }
+            WorkerOutcome::Transcribed(_) => notes.push(NO_SPEAKERS.to_owned()),
+        }
+    } else if system_track.is_some() {
+        models::download_companions(app);
+        notes.push(
+            "Speaker labels need the speaker models, which are downloading now. Use Transcribe \
+             again when they're ready."
+                .to_owned(),
+        );
+    }
+
+    // Assemble the final transcript: "Me" for the mic, Speaker 1…N for the meeting track.
+    let Assembled {
+        speakers: speaker_rows,
+        tracks: final_tracks,
+        removed,
+    } = assemble(&transcripts, diarization.as_ref());
+    if removed > 0 {
+        log::info!("removed {removed} mic utterance(s) that echoed the meeting audio");
+    }
+    let refs: Vec<(&str, &[NewUtterance])> = final_tracks
+        .iter()
+        .map(|(k, u)| (k.as_str(), u.as_slice()))
+        .collect();
+    if let Err(e) = db.save_transcript(meeting_id, &speaker_rows, &refs) {
+        return fail(&format!("saving the transcript failed: {e}"));
     }
 
     if let Some(lang) = language_found {
@@ -334,16 +442,114 @@ fn run_job(
     );
 }
 
-/// Runs one transcription in a fresh worker process and relays its progress.
-#[allow(clippy::too_many_arguments)]
+/// Default for Settings → Speakers → sensitivity (0–100).
+pub const DEFAULT_SENSITIVITY: f32 = 50.0;
+
+fn clustering_threshold(db: &Db, embedding: &models::CatalogModel) -> f32 {
+    let s = db
+        .get_setting("speakers.sensitivity")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(DEFAULT_SENSITIVITY)
+        .clamp(0.0, 100.0);
+    sensitivity_to_threshold(s, embedding.cluster_threshold.unwrap_or(0.5))
+}
+
+/// How far the sensitivity slider moves the threshold either side of the model's default.
+const SENSITIVITY_SPAN: f32 = 0.3;
+
+/// Sensitivity 0–100 -> clustering distance threshold around the embedding model's tuned
+/// default (at 50). Higher sensitivity lowers the threshold, splitting voices into more speakers.
+pub fn sensitivity_to_threshold(s: f32, default: f32) -> f32 {
+    (default + SENSITIVITY_SPAN * (50.0 - s) / 50.0).max(0.05)
+}
+
+/// Builds the speaker rows and per-track utterances: Speaker 1…N for the meeting track (in order
+/// of first appearance), "Me" for the mic. Returns how many mic utterances were dropped as bleed.
+struct Assembled {
+    speakers: Vec<NewSpeaker>,
+    /// (track kind, utterances)
+    tracks: Vec<(String, Vec<NewUtterance>)>,
+    /// Mic utterances dropped as bleed.
+    removed: usize,
+}
+
+fn assemble(transcripts: &[(String, Transcript)], diarization: Option<&Diarization>) -> Assembled {
+    let mut rows = Vec::new();
+    let mut out = Vec::new();
+    let system = transcripts.iter().find(|(k, _)| k == "system");
+    let system_words = system.map(|(_, t)| speakers::words(t)).unwrap_or_default();
+
+    let mut system_utts = Vec::new();
+    if system.is_some() {
+        let labels = match diarization {
+            Some(d) if !d.turns.is_empty() => {
+                let mut l = speakers::assign(&system_words, &d.turns);
+                speakers::smooth(&mut l);
+                l
+            }
+            // Nothing to separate, or separation failed: speaker unknown.
+            _ => vec![None; system_words.len()],
+        };
+        let mut grouped = speakers::group(&system_words, &labels);
+        let n = speakers::renumber(&mut grouped);
+        system_utts = grouped
+            .into_iter()
+            .map(|(l, mut u)| {
+                u.speaker = l.map(|s| s as usize);
+                u
+            })
+            .collect();
+        rows.extend((1..=n).map(|i| NewSpeaker {
+            label: format!("Speaker {i}"),
+            is_me: false,
+        }));
+    }
+
+    let mut removed = 0;
+    if let Some((_, t)) = transcripts.iter().find(|(k, _)| k == "mic") {
+        let words = speakers::words(t);
+        let me = rows.len();
+        rows.push(NewSpeaker {
+            label: "Me".into(),
+            is_me: true,
+        });
+        let mut mic: Vec<NewUtterance> = speakers::group(&words, &vec![None; words.len()])
+            .into_iter()
+            .map(|(_, mut u)| {
+                u.speaker = Some(me);
+                u
+            })
+            .collect();
+        removed = speakers::drop_bleed(&mut mic, &system_words);
+        out.push(("mic".to_owned(), mic));
+    }
+    if system.is_some() {
+        out.push(("system".to_owned(), system_utts));
+    }
+    Assembled {
+        speakers: rows,
+        tracks: out,
+        removed,
+    }
+}
+
+/// Which part of a meeting's processing a worker run is, for overall progress.
+#[derive(Clone, Copy)]
+struct Step<'a> {
+    index: usize,
+    count: usize,
+    track_kind: &'a str,
+}
+
+/// Runs one request in a fresh worker process and relays its progress.
 fn run_worker(
     app: &AppHandle,
     job_id: i64,
     meeting_id: i64,
-    track_index: usize,
-    track_count: usize,
-    track_kind: &str,
-    job: TranscribeJob,
+    step: Step,
+    request: Request,
     current: &Arc<Mutex<Option<Current>>>,
 ) -> WorkerOutcome {
     let mut cmd = match crate::worker::command() {
@@ -375,7 +581,7 @@ fn run_worker(
         }
     });
 
-    let request = serde_json::to_string(&Request::Transcribe { id: 1, job }).expect("serializes");
+    let request = serde_json::to_string(&request).expect("serializes");
     if let Err(e) = writeln!(stdin, "{request}").and_then(|_| stdin.flush()) {
         let _ = child.kill();
         return WorkerOutcome::Died(format!("failed to send job: {e}"));
@@ -397,22 +603,23 @@ fn run_worker(
         };
         match ev {
             Event::Progress { stage, pct, .. } => {
-                // Weight stages within a track, then tracks within the meeting.
+                // Weight stages within a step, then steps within the meeting.
                 let (base, span) = match stage {
                     Stage::Decode => (0.0, 5.0),
                     Stage::Vad => (5.0, 5.0),
                     Stage::LoadModel => (10.0, 5.0),
                     Stage::Transcribe => (15.0, 85.0),
+                    Stage::Diarize => (5.0, 95.0),
                 };
-                let track_pct = base + span * (pct / 100.0);
-                let overall = (track_index as f32 * 100.0 + track_pct) / track_count as f32;
+                let step_pct = base + span * (pct / 100.0);
+                let overall = (step.index as f32 * 100.0 + step_pct) / step.count as f32;
                 let _ = app.emit(
                     EVENT_PROGRESS,
                     Progress {
                         meeting_id,
-                        track: track_index,
-                        tracks: track_count,
-                        track_kind: track_kind.into(),
+                        track: step.index,
+                        tracks: step.count,
+                        track_kind: step.track_kind.into(),
                         stage,
                         pct: overall,
                     },
@@ -432,7 +639,11 @@ fn run_worker(
                 }
             }
             Event::Result { transcript, .. } => {
-                outcome = Some(WorkerOutcome::Done(transcript));
+                outcome = Some(WorkerOutcome::Transcribed(transcript));
+                break;
+            }
+            Event::Diarization { diarization, .. } => {
+                outcome = Some(WorkerOutcome::Diarized(diarization));
                 break;
             }
             Event::Error {
@@ -479,91 +690,194 @@ fn run_worker(
     outcome.unwrap_or_else(|| WorkerOutcome::Died("worker exited without a result".into()))
 }
 
-/// Splits a track's words into utterances at pauses longer than [`UTTERANCE_PAUSE_MS`].
-pub fn group_utterances(t: &Transcript) -> Vec<NewUtterance> {
-    let mut out: Vec<NewUtterance> = Vec::new();
-    let mut prev_end: Option<u64> = None;
-    for w in t.segments.iter().flat_map(|s| s.words.iter()) {
-        if w.text.trim().is_empty() {
-            continue;
-        }
-        let new = match (prev_end, out.last()) {
-            (Some(end), Some(_)) => w.start_ms.saturating_sub(end) > UTTERANCE_PAUSE_MS,
-            _ => true,
-        };
-        if new {
-            out.push(NewUtterance {
-                start_ms: w.start_ms as i64,
-                ..Default::default()
-            });
-        }
-        let u = out.last_mut().expect("pushed");
-        u.end_ms = w.end_ms as i64;
-        u.text.push_str(&w.text);
-        u.words.push(NewWord {
-            start_ms: w.start_ms as i64,
-            end_ms: w.end_ms as i64,
-            text: w.text.clone(),
-            prob: w.prob,
-        });
-        prev_end = Some(w.end_ms);
-    }
-    for u in &mut out {
-        u.text = u.text.trim().to_owned();
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use earshot_protocol::{Segment, Word};
+    use earshot_protocol::{Segment, SpeakerTurn, Word};
 
-    fn word(text: &str, s: u64, e: u64) -> Word {
-        Word {
-            start_ms: s,
-            end_ms: e,
-            text: text.into(),
-            prob: 0.9,
+    fn transcript(words: &[(&str, u64, u64)]) -> Transcript {
+        Transcript {
+            language: "en".into(),
+            backend_used: "cpu".into(),
+            audio_ms: 60_000,
+            elapsed_ms: 1,
+            segments: vec![Segment {
+                start_ms: 0,
+                end_ms: 60_000,
+                text: String::new(),
+                words: words
+                    .iter()
+                    .map(|(t, s, e)| Word {
+                        start_ms: *s,
+                        end_ms: *e,
+                        text: format!(" {t}"),
+                        prob: 0.9,
+                    })
+                    .collect(),
+            }],
         }
     }
 
     #[test]
-    fn utterances_split_on_pauses_not_segments() {
-        let t = Transcript {
-            language: "en".into(),
-            backend_used: "cpu".into(),
-            audio_ms: 30_000,
+    fn assemble_labels_speakers_and_me() {
+        let system = transcript(&[
+            ("Hello", 0, 400),
+            ("all.", 400, 800),
+            ("Hi", 2000, 2300),
+            ("Sam.", 2300, 2600),
+        ]);
+        let mic = transcript(&[("Morning.", 5000, 5600)]);
+        let d = Diarization {
+            audio_ms: 60_000,
             elapsed_ms: 1,
-            segments: vec![
-                Segment {
+            num_speakers: 2,
+            turns: vec![
+                SpeakerTurn {
                     start_ms: 0,
-                    end_ms: 9000,
-                    text: String::new(),
-                    words: vec![word(" Hello", 0, 400), word(" there.", 400, 900)],
+                    end_ms: 1000,
+                    speaker: 4,
                 },
-                // New segment but no pause: same utterance. Then a 10 s pause: new utterance.
-                Segment {
-                    start_ms: 900,
-                    end_ms: 21_000,
-                    text: String::new(),
-                    words: vec![
-                        word(" How", 1000, 1200),
-                        word(" are", 1200, 1400),
-                        word(" you?", 11_400, 11_800),
-                    ],
+                SpeakerTurn {
+                    start_ms: 1900,
+                    end_ms: 2700,
+                    speaker: 1,
                 },
             ],
         };
-        let u = group_utterances(&t);
+        let Assembled {
+            speakers: rows,
+            tracks,
+            removed,
+        } = assemble(&[("mic".into(), mic), ("system".into(), system)], Some(&d));
+        assert_eq!(removed, 0);
         assert_eq!(
-            u.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(),
-            ["Hello there. How are", "you?"]
+            rows.iter()
+                .map(|r| (r.label.as_str(), r.is_me))
+                .collect::<Vec<_>>(),
+            [("Speaker 1", false), ("Speaker 2", false), ("Me", true)]
         );
+        let (_, mic) = tracks.iter().find(|(k, _)| k == "mic").unwrap();
+        let (_, sys) = tracks.iter().find(|(k, _)| k == "system").unwrap();
+        assert_eq!(mic[0].speaker, Some(2));
         assert_eq!(
-            (u[0].start_ms, u[0].end_ms, u[1].start_ms),
-            (0, 1400, 11_400)
+            sys.iter()
+                .map(|u| (u.speaker, u.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(Some(0), "Hello all."), (Some(1), "Hi Sam.")]
         );
-        assert_eq!(u[0].words.len(), 4);
+    }
+
+    #[test]
+    fn without_diarization_the_meeting_track_has_no_speaker() {
+        let system = transcript(&[("Hello", 0, 400)]);
+        let Assembled {
+            speakers: rows,
+            tracks,
+            ..
+        } = assemble(&[("system".into(), system)], None);
+        assert!(rows.is_empty());
+        assert_eq!(tracks[0].1[0].speaker, None);
+    }
+
+    /// End-to-end check with the real worker and models; not run by default.
+    /// Env: EARSHOT_E2E_WORKER (worker exe), EARSHOT_E2E_DIR (mic.flac + system.flac),
+    /// EARSHOT_E2E_MODELS (dir with the whisper, VAD, segmentation and embedding files),
+    /// optional EARSHOT_E2E_THRESHOLD.
+    #[test]
+    #[ignore]
+    fn end_to_end_with_real_worker() {
+        use std::io::{BufRead, BufReader, Write};
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let (worker, dir, models) = (
+            env("EARSHOT_E2E_WORKER"),
+            std::path::PathBuf::from(env("EARSHOT_E2E_DIR")),
+            std::path::PathBuf::from(env("EARSHOT_E2E_MODELS")),
+        );
+        let path = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().into_owned();
+        let run = |req: Request| -> Event {
+            let mut child = std::process::Command::new(&worker)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+            let out = BufReader::new(child.stdout.take().unwrap());
+            let ev = out
+                .lines()
+                .map_while(Result::ok)
+                .filter_map(|l| serde_json::from_str::<Event>(&l).ok())
+                .find(|e| !matches!(e, Event::Progress { .. }))
+                .unwrap();
+            drop(stdin);
+            let _ = child.wait();
+            ev
+        };
+        let mut transcripts = Vec::new();
+        for kind in ["mic", "system"] {
+            let ev = run(Request::Transcribe {
+                id: 1,
+                job: TranscribeJob {
+                    audio_path: path(&dir, &format!("{kind}.flac")),
+                    model_path: path(&models, "ggml-large-v3-turbo.bin"),
+                    vad_model_path: Some(path(&models, "ggml-silero-v6.2.0.bin")),
+                    language: Some("en".into()),
+                    backend: Backend::Auto,
+                    dtw_preset: Some("large-v3-turbo".into()),
+                },
+            });
+            let Event::Result { transcript, .. } = ev else {
+                panic!("{ev:?}")
+            };
+            transcripts.push((kind.to_owned(), transcript));
+        }
+        let threshold = std::env::var("EARSHOT_E2E_THRESHOLD")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(0.5);
+        let ev = run(Request::Diarize {
+            id: 1,
+            job: DiarizeJob {
+                audio_path: path(&dir, "system.flac"),
+                segmentation_model_path: path(&models, "pyannote-segmentation-3.0.onnx"),
+                embedding_model_path: path(
+                    &models,
+                    "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+                ),
+                num_speakers: None,
+                threshold,
+            },
+        });
+        let Event::Diarization { diarization, .. } = ev else {
+            panic!("{ev:?}")
+        };
+        println!(
+            "diarization: {} speakers in {} ms",
+            diarization.num_speakers, diarization.elapsed_ms
+        );
+        let Assembled {
+            speakers: rows,
+            tracks,
+            removed,
+        } = assemble(&transcripts, Some(&diarization));
+        println!("removed as bleed: {removed}");
+        let mut all: Vec<(&NewUtterance, &str)> = tracks
+            .iter()
+            .flat_map(|(_, us)| us.iter())
+            .map(|u| (u, u.speaker.map_or("?", |i| rows[i].label.as_str())))
+            .collect();
+        all.sort_by_key(|(u, _)| u.start_ms);
+        for (u, who) in all {
+            println!("[{:6.1}] {who:<10} {}", u.start_ms as f64 / 1000.0, u.text);
+        }
+    }
+
+    #[test]
+    fn sensitivity_maps_to_threshold() {
+        assert!((sensitivity_to_threshold(50.0, 1.0) - 1.0).abs() < 1e-6);
+        assert!((sensitivity_to_threshold(0.0, 1.0) - 1.3).abs() < 1e-6);
+        assert!((sensitivity_to_threshold(100.0, 1.0) - 0.7).abs() < 1e-6);
+        assert!(sensitivity_to_threshold(100.0, 0.2) > 0.0);
     }
 }
