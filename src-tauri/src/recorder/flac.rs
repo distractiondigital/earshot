@@ -62,18 +62,24 @@ pub struct FlacWriter {
     total_frames: u64,
     min_frame_bytes: usize,
     max_frame_bytes: usize,
+    /// False after [`FlacWriter::resume`]: frames from before the crash were not measured.
+    frame_sizes_known: bool,
 }
 
 impl FlacWriter {
     pub fn create(path: &Path, sample_rate: u32, channels: u16) -> io::Result<Self> {
         let info = stream_info(sample_rate, channels)?;
-        let mut file = BufWriter::with_capacity(256 * 1024, File::create(path)?);
+        let mut file = File::create(path)?;
         file.write_all(&header_bytes(&info)?)?;
+        Self::with_file(file, info, channels)
+    }
+
+    fn with_file(file: File, info: StreamInfo, channels: u16) -> io::Result<Self> {
         let config = flacenc::config::Encoder::default()
             .into_verified()
             .map_err(|(_, e)| invalid(e))?;
         Ok(Self {
-            file,
+            file: BufWriter::with_capacity(256 * 1024, file),
             config,
             info,
             framebuf: FrameBuf::with_size(channels as usize, BLOCK_SIZE).map_err(invalid)?,
@@ -84,7 +90,46 @@ impl FlacWriter {
             total_frames: 0,
             min_frame_bytes: usize::MAX,
             max_frame_bytes: 0,
+            frame_sizes_known: true,
         })
+    }
+
+    /// Reopens a track left by an interrupted recording so recording can continue in the same
+    /// file. Keeps every intact full-size frame (a torn or short final frame, at most one frame
+    /// of audio, is dropped) and positions the writer after it.
+    pub fn resume(path: &Path) -> io::Result<Self> {
+        let data = std::fs::read(path)?;
+        if data.len() < HEADER_LEN as usize || &data[..4] != b"fLaC" {
+            return Err(invalid("not a FLAC file written by Earshot"));
+        }
+        let sample_rate =
+            (u32::from(data[18]) << 12) | (u32::from(data[19]) << 4) | (u32::from(data[20]) >> 4);
+        let channels = u16::from((data[20] >> 1) & 0x07) + 1;
+        let scan = scan_frames(&data[HEADER_LEN as usize..]);
+        drop(data);
+
+        let info = stream_info(sample_rate, channels)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.set_len(HEADER_LEN + scan.full_len as u64)?;
+        file.seek(SeekFrom::Start(0))?;
+        // Header with unknown length again, exactly as while recording.
+        file.write_all(&header_bytes(&info)?)?;
+        file.seek(SeekFrom::End(0))?;
+        file.sync_all()?;
+        let mut w = Self::with_file(file, info, channels)?;
+        w.frame_number = scan.full_frames as usize;
+        w.total_frames = scan.full_samples;
+        // Sizes of frames written before the crash are unknown; leave them unspecified.
+        w.frame_sizes_known = false;
+        Ok(w)
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.info.sample_rate() as u32
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels as u16
     }
 
     /// Number of sample frames (per channel) accepted so far, including any not yet encoded.
@@ -162,7 +207,7 @@ impl FlacWriter {
     pub fn finish(mut self) -> io::Result<u64> {
         self.encode_pending()?;
         self.info.set_total_samples(self.total_frames as usize);
-        if self.max_frame_bytes > 0 {
+        if self.frame_sizes_known && self.max_frame_bytes > 0 {
             self.info
                 .set_frame_sizes(self.min_frame_bytes, self.max_frame_bytes)
                 .map_err(invalid)?;
@@ -196,8 +241,8 @@ pub fn recover(path: &Path) -> io::Result<Recovered> {
         (u32::from(data[18]) << 12) | (u32::from(data[19]) << 4) | (u32::from(data[20]) >> 4);
     let channels = u16::from((data[20] >> 1) & 0x07) + 1;
 
-    let (frames, good_len) = scan_frames(&data[HEADER_LEN as usize..]);
-    let good_len = HEADER_LEN + good_len as u64;
+    let scan = scan_frames(&data[HEADER_LEN as usize..]);
+    let (frames, good_len) = (scan.samples, HEADER_LEN + scan.len as u64);
     drop(data);
 
     let mut info = stream_info(sample_rate, channels)?;
@@ -310,10 +355,22 @@ fn parse_frame_header(b: &[u8]) -> Option<FrameHeaderInfo> {
     })
 }
 
+/// Intact prefix of a track file, as found by [`scan_frames`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Scan {
+    /// Sample frames and byte length (after the header) of all intact FLAC frames.
+    samples: u64,
+    len: usize,
+    /// The same, up to the last full-size ([`BLOCK_SIZE`]) frame: where appending can resume.
+    full_samples: u64,
+    full_len: usize,
+    full_frames: u64,
+}
+
 /// Walks the frames after the header. A frame is intact when its header is valid, its number is
-/// the next in sequence, and its CRC-16 matches. Returns (sample frames, byte length) of the
-/// intact prefix.
-fn scan_frames(data: &[u8]) -> (u64, usize) {
+/// the next in sequence, and its CRC-16 matches.
+fn scan_frames(data: &[u8]) -> Scan {
+    let mut scan = Scan::default();
     let mut pos = 0usize;
     let mut samples = 0u64;
     let mut expected = 0u64;
@@ -342,11 +399,19 @@ fn scan_frames(data: &[u8]) -> (u64, usize) {
         samples += h.block_size;
         expected += 1;
         pos = end;
+        // Only a run of full-size frames can be appended to (a short frame must be last).
+        if h.block_size == BLOCK_SIZE as u64 && scan.full_frames + 1 == expected {
+            scan.full_samples = samples;
+            scan.full_len = pos;
+            scan.full_frames = expected;
+        }
         if pos == data.len() {
             break;
         }
     }
-    (samples, pos)
+    scan.samples = samples;
+    scan.len = pos;
+    scan
 }
 
 #[cfg(test)]
@@ -427,6 +492,47 @@ mod tests {
         w.write(&sine(500, 1, 16_000)).unwrap();
         assert_eq!(w.finish().unwrap(), 10_500);
         assert_eq!(decode(&path).0, 10_500);
+    }
+
+    #[test]
+    fn resume_appends_after_crash() {
+        let path = temp_path("resume");
+        let first = sine(BLOCK_SIZE * 5 + 300, 2, 48_000);
+        let mut w = FlacWriter::create(&path, 48_000, 2).unwrap();
+        w.write(&first).unwrap();
+        w.flush().unwrap();
+        // Crash: 5 full frames reached the disk, the last 300 samples were still in memory.
+        std::mem::forget(w);
+
+        let mut w = FlacWriter::resume(&path).unwrap();
+        assert_eq!((w.sample_rate(), w.channels()), (48_000, 2));
+        assert_eq!(w.frames_written(), (BLOCK_SIZE * 5) as u64);
+        let second = sine(1_000, 2, 48_000);
+        w.write(&second).unwrap();
+        assert_eq!(w.finish().unwrap(), (BLOCK_SIZE * 5 + 1_000) as u64);
+
+        let (frames, left) = decode(&path);
+        assert_eq!(frames, (BLOCK_SIZE * 5 + 1_000) as u64);
+        let expected: Vec<i32> = first[..BLOCK_SIZE * 5 * 2]
+            .iter()
+            .chain(&second)
+            .step_by(2)
+            .copied()
+            .collect();
+        assert_eq!(left, expected);
+    }
+
+    #[test]
+    fn resume_drops_short_final_frame_of_finished_file() {
+        let path = temp_path("resume-finished");
+        let mut w = FlacWriter::create(&path, 16_000, 1).unwrap();
+        w.write(&sine(BLOCK_SIZE * 3 + 50, 1, 16_000)).unwrap();
+        w.finish().unwrap();
+        let mut w = FlacWriter::resume(&path).unwrap();
+        assert_eq!(w.frames_written(), (BLOCK_SIZE * 3) as u64);
+        w.write(&sine(10, 1, 16_000)).unwrap();
+        assert_eq!(w.finish().unwrap(), (BLOCK_SIZE * 3 + 10) as u64);
+        assert_eq!(decode(&path).0, (BLOCK_SIZE * 3 + 10) as u64);
     }
 
     #[test]

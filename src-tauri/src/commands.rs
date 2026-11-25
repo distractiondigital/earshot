@@ -114,6 +114,16 @@ pub async fn start_recording(
 }
 
 #[tauri::command]
+pub async fn resume_recording(app: AppHandle, id: i64) -> Result<RecorderState, String> {
+    blocking(move || app.state::<Recorder>().resume(&app, id)).await
+}
+
+#[tauri::command]
+pub fn interrupted_meeting(db: State<'_, Db>) -> Option<recorder::Interrupted> {
+    recorder::interrupted(&db)
+}
+
+#[tauri::command]
 pub async fn stop_recording(app: AppHandle) -> Result<i64, String> {
     blocking(move || app.state::<Recorder>().stop(&app)).await
 }

@@ -180,6 +180,24 @@ impl Db {
         Ok(())
     }
 
+    pub fn meeting(&self, id: i64) -> Result<Option<MeetingRow>, DbError> {
+        Ok(self.list_meetings()?.into_iter().find(|m| m.id == id))
+    }
+
+    pub fn latest_meeting_with_status(&self, status: &str) -> Result<Option<MeetingRow>, DbError> {
+        Ok(self
+            .list_meetings()?
+            .into_iter()
+            .find(|m| m.status == status))
+    }
+
+    /// Marks a track as being written again (continuing an interrupted meeting).
+    pub fn reopen_track(&self, track_id: i64) -> Result<(), DbError> {
+        self.conn()
+            .execute("UPDATE tracks SET finalized = 0 WHERE id = ?1", [track_id])?;
+        Ok(())
+    }
+
     /// Meetings left in `recording` by a crash become `incomplete` (offered for recovery).
     pub fn mark_interrupted(&self) -> Result<usize, DbError> {
         Ok(self.conn().execute(

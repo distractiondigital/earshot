@@ -51,11 +51,23 @@ export interface Meeting {
   tags: string[];
 }
 
+export interface Interrupted {
+  meetingId: number;
+  title: string;
+  startedAt: number;
+  stoppedAt: number;
+}
+
+/** The hotkey continues an interruption this recent instead of starting a new recording. */
+export const QUICK_CONTINUE_MS = 15 * 60 * 1000;
+
 export const recorder = {
   state: () => invoke<RecorderState>("recorder_state"),
   start: (options: { micDevice?: string | null; system?: SystemSource | null }) =>
     invoke<RecorderState>("start_recording", { options }),
   stop: () => invoke<number>("stop_recording"),
+  resume: (id: number) => invoke<RecorderState>("resume_recording", { id }),
+  interrupted: () => invoke<Interrupted | null>("interrupted_meeting"),
   pause: (paused: boolean) => invoke<RecorderState>("pause_recording", { paused }),
   sources: () => invoke<Sources>("list_sources"),
   meetings: () => invoke<Meeting[]>("list_meetings"),

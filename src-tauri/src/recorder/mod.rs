@@ -29,6 +29,9 @@ pub const EVENT_STOPPED: &str = "recorder://stopped";
 /// Seconds of audio each ring buffer holds before samples are dropped.
 const RING_SECONDS: u32 = 10;
 const LEVELS_INTERVAL: Duration = Duration::from_millis(66);
+/// The hotkey / tray continue an interrupted meeting instead of starting a new one within this
+/// time of the interruption.
+pub const QUICK_CONTINUE_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -295,10 +298,137 @@ impl Recorder {
         Ok(session.meeting_id)
     }
 
-    /// Starts with saved defaults, or stops if already recording (hotkey / tray).
+    /// Continues an interrupted meeting in the same track files. Each track is reopened after its
+    /// last intact frame; the clock resumes at the recorded length plus the time the app was down,
+    /// so the writers pad the outage with silence and the tracks stay aligned with real time.
+    pub fn resume(&self, app: &AppHandle, meeting_id: i64) -> Result<RecorderState, String> {
+        let mut guard = self.lock();
+        if guard.is_some() {
+            return Err("Already recording".into());
+        }
+        let db = app.state::<Db>();
+        let meeting = db
+            .meeting(meeting_id)
+            .map_err(err)?
+            .ok_or("Meeting not found")?;
+        if meeting.status != "incomplete" {
+            return Err(format!("Meeting is {}, not interrupted", meeting.status));
+        }
+        let rows = db.tracks(meeting_id).map_err(err)?;
+        let stopped_at = last_write_ms(&rows).unwrap_or_else(now_ms);
+
+        let mut warnings = Vec::new();
+        let mut opened = Vec::new();
+        for t in rows {
+            match flac::FlacWriter::resume(Path::new(&t.path)) {
+                Ok(w) => opened.push((t, w)),
+                Err(e) => warnings.push(format!("{}: cannot reopen {}: {e}", t.kind, t.path)),
+            }
+        }
+        if opened.is_empty() {
+            return Err(format!("Nothing to continue.\n{}", warnings.join("\n")));
+        }
+        let recorded = opened
+            .iter()
+            .map(|(_, w)| {
+                Duration::from_secs_f64(w.frames_written() as f64 / f64::from(w.sample_rate()))
+            })
+            .max()
+            .unwrap_or_default();
+        let gap = Duration::from_millis(now_ms().saturating_sub(stopped_at).max(0) as u64);
+        let clock = Arc::new(Clock::start_at(recorded + gap));
+
+        let mic_device = db
+            .get_setting("recording.micDevice")
+            .ok()
+            .flatten()
+            .filter(|d| !d.is_empty());
+        let mut tracks = Vec::new();
+        for (row, w) in opened {
+            let kind: &'static str = if row.kind == "mic" { "mic" } else { "system" };
+            let prepared = if kind == "mic" {
+                capture::prepare_mic_like(mic_device.as_deref(), w.sample_rate(), w.channels())
+            } else {
+                system_source_for(row.source.as_deref(), &mut warnings)
+                    .and_then(|s| capture::prepare_system(&s)?.ok_or_else(|| "no source".into()))
+            };
+            let p = match prepared {
+                Ok(p) if p.format.sample_rate == w.sample_rate() => p,
+                Ok(p) => {
+                    warnings.push(format!(
+                        "{kind}: the device now runs at {} Hz instead of {} Hz; this track was not continued",
+                        p.format.sample_rate,
+                        w.sample_rate()
+                    ));
+                    close_track(&db, row.id, w);
+                    continue;
+                }
+                Err(e) => {
+                    warnings.push(format!("{kind}: {e}"));
+                    close_track(&db, row.id, w);
+                    continue;
+                }
+            };
+            let label = p.label.clone();
+            let (sink, consumer, overflow) =
+                track::ring(p.format.sample_rate, p.format.channels, RING_SECONDS);
+            let writer = TrackWriter::spawn(
+                kind,
+                w,
+                p.format.channels,
+                consumer,
+                overflow,
+                clock.clone(),
+            )
+            .map_err(err)?;
+            db.reopen_track(row.id).map_err(err)?;
+            tracks.push(LiveTrack {
+                kind,
+                track_id: row.id,
+                label,
+                capture: Some(p.start(sink)),
+                writer,
+            });
+        }
+        if tracks.is_empty() {
+            let _ = recover(&db, meeting_id);
+            return Err(format!(
+                "Could not continue recording.\n{}",
+                warnings.join("\n")
+            ));
+        }
+        db.set_meeting_status(meeting_id, "recording", None, None)
+            .map_err(err)?;
+
+        let (levels_stop, levels_join) = spawn_levels(app.clone(), clock.clone(), &tracks);
+        *guard = Some(Session {
+            meeting_id,
+            started_at: meeting.started_at,
+            clock,
+            tracks,
+            warnings,
+            levels_stop,
+            levels_join: Some(levels_join),
+        });
+        drop(guard);
+        log::info!(
+            "recording continued: meeting {meeting_id} after {:.1} s outage",
+            gap.as_secs_f64()
+        );
+        self.emit_state(app);
+        crate::pill::show(app);
+        Ok(self.state())
+    }
+
+    /// Hotkey / tray: stop if recording; otherwise continue a meeting interrupted in the last
+    /// few minutes, or start a new one with the saved defaults.
     pub fn toggle(&self, app: &AppHandle) {
         let result = if self.is_active() {
             self.stop(app).map(|_| ())
+        } else if let Some(i) = interrupted(&app.state::<Db>())
+            .filter(|i| now_ms() - i.stopped_at < QUICK_CONTINUE_WINDOW.as_millis() as i64)
+        {
+            self.resume(app, i.meeting_id).map(|_| ())
         } else {
             self.start(app, StartOptions::default()).map(|_| ())
         };
@@ -307,6 +437,76 @@ impl Recorder {
             let _ = app.emit("recorder://error", e);
         }
     }
+}
+
+/// Finalizes a reopened track that will not be continued, keeping what was recorded.
+fn close_track(db: &Db, track_id: i64, w: flac::FlacWriter) {
+    let rate = u64::from(w.sample_rate().max(1));
+    match w.finish() {
+        Ok(frames) => {
+            let _ = db.finalize_track(track_id, (frames * 1000 / rate) as i64);
+        }
+        Err(e) => log::error!("finalizing track {track_id} failed: {e}"),
+    }
+}
+
+/// Picks the meeting-audio source to continue with, from the label stored with the track.
+fn system_source_for(
+    label: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Result<SystemSource, String> {
+    match label {
+        None | Some("All system audio") => Ok(SystemSource::All),
+        Some(name) => {
+            if let Some(app) = capture::list_audio_apps()
+                .into_iter()
+                .find(|a| a.name == name)
+            {
+                Ok(SystemSource::App {
+                    pid: app.pid,
+                    name: app.name,
+                })
+            } else {
+                warnings.push(format!(
+                    "{name} isn't playing audio right now; recording all system audio instead."
+                ));
+                Ok(SystemSource::All)
+            }
+        }
+    }
+}
+
+/// When track files were last written (≈ when the app stopped), in Unix ms.
+fn last_write_ms(tracks: &[crate::db::TrackRow]) -> Option<i64> {
+    tracks
+        .iter()
+        .filter_map(|t| std::fs::metadata(&t.path).and_then(|m| m.modified()).ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .max()
+}
+
+/// An interrupted meeting that can be continued or saved.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Interrupted {
+    pub meeting_id: i64,
+    pub title: String,
+    pub started_at: i64,
+    /// When audio stopped being written (Unix ms).
+    pub stopped_at: i64,
+}
+
+/// The most recently interrupted meeting, if any.
+pub fn interrupted(db: &Db) -> Option<Interrupted> {
+    let m = db.latest_meeting_with_status("incomplete").ok().flatten()?;
+    let tracks = db.tracks(m.id).ok()?;
+    Some(Interrupted {
+        meeting_id: m.id,
+        title: m.title,
+        started_at: m.started_at,
+        stopped_at: last_write_ms(&tracks).unwrap_or(m.started_at),
+    })
 }
 
 fn start_track(
@@ -321,16 +521,9 @@ fn start_track(
     let fmt = p.format;
     let label = p.label.clone();
     let (sink, consumer, overflow) = track::ring(fmt.sample_rate, fmt.channels, RING_SECONDS);
-    let writer = TrackWriter::spawn(
-        kind,
-        path.clone(),
-        fmt.sample_rate,
-        fmt.channels,
-        consumer,
-        overflow,
-        clock,
-    )
-    .map_err(err)?;
+    let flac = flac::FlacWriter::create(&path, fmt.sample_rate, fmt.channels).map_err(err)?;
+    let writer =
+        TrackWriter::spawn(kind, flac, fmt.channels, consumer, overflow, clock).map_err(err)?;
     let track_id = db
         .add_track(
             meeting_id,

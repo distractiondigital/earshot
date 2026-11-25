@@ -62,6 +62,8 @@ pub fn run() {
             commands::recorder_state,
             commands::start_recording,
             commands::stop_recording,
+            commands::resume_recording,
+            commands::interrupted_meeting,
             commands::pause_recording,
             commands::list_sources,
             commands::list_meetings,

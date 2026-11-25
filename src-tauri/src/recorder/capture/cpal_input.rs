@@ -59,6 +59,42 @@ pub fn prepare_mic(device_id_wanted: Option<&str>) -> Result<Prepared, String> {
     Ok(prepare(device, config))
 }
 
+/// Opens the mic preferring `sample_rate` / `channels` (to continue an existing track file).
+pub fn prepare_mic_like(
+    device_id_wanted: Option<&str>,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Prepared, String> {
+    let host = cpal::default_host();
+    let device = device_id_wanted
+        .and_then(|want| {
+            host.input_devices()
+                .ok()?
+                .find(|d| device_id(d).as_deref() == Some(want))
+        })
+        .or_else(|| host.default_input_device())
+        .ok_or("No microphone found")?;
+    let ranges: Vec<_> = device
+        .supported_input_configs()
+        .map(|r| r.collect())
+        .unwrap_or_default();
+    let fits = |r: &cpal::SupportedStreamConfigRange| {
+        r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate()
+    };
+    let config = ranges
+        .iter()
+        .find(|r| r.channels() == channels && fits(r))
+        .or_else(|| ranges.iter().find(|r| fits(r)))
+        .map(|r| r.with_sample_rate(sample_rate));
+    let config = match config {
+        Some(c) => c,
+        None => device
+            .default_input_config()
+            .map_err(|e| format!("Microphone unavailable: {e}"))?,
+    };
+    Ok(prepare(device, config))
+}
+
 #[cfg(not(windows))]
 pub fn prepare_system_loopback() -> Result<Prepared, String> {
     let host = cpal::default_host();

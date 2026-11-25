@@ -15,6 +15,9 @@ Requirements:
 - Windows: Visual Studio Build Tools with the C++ workload, WebView2 (preinstalled on Windows 11)
 - macOS: Xcode Command Line Tools
 
+On Windows, double-click `dev.cmd` (or run `npm run tauri:dev`) to start "Earshot Dev" with hot
+reload. It uses its own data folder and never updates itself.
+
 ```sh
 npm ci
 npm run tauri:dev      # run "Earshot Dev" with hot reload (separate data folder, no updater)

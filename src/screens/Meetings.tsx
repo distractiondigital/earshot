@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Circle, Headphones, Pause, Play, Square, X } from "lucide-react";
+import { AlertTriangle, Circle, Headphones, Pause, Play, Square, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -11,9 +11,11 @@ import { ipc } from "@/lib/ipc";
 import {
   formatDuration,
   formatElapsed,
+  QUICK_CONTINUE_MS,
   recorder,
   useLevels,
   useRecorderState,
+  type Interrupted,
   type Meeting,
   type Sources,
   type SystemSource,
@@ -24,9 +26,11 @@ export function Meetings() {
   const [meetings, setMeetings] = useState<Meeting[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [detailsFor, setDetailsFor] = useState<number | null>(null);
+  const [interrupted, setInterrupted] = useState<Interrupted | null>(null);
 
   const refresh = useCallback(() => {
     recorder.meetings().then(setMeetings).catch((e) => setError(String(e)));
+    recorder.interrupted().then(setInterrupted).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -57,6 +61,10 @@ export function Meetings() {
         </div>
       )}
 
+      {!recording && interrupted && (
+        <InterruptedBanner info={interrupted} onDone={refresh} onError={setError} />
+      )}
+
       {recording ? (
         <RecordingCard />
       ) : (
@@ -84,6 +92,71 @@ export function Meetings() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** Shown after a crash: continue the same meeting, or keep what was recorded. */
+function InterruptedBanner({
+  info,
+  onDone,
+  onError,
+}: {
+  info: Interrupted;
+  onDone: () => void;
+  onError: (e: string) => void;
+}) {
+  const [busy, setBusy] = useState<"continue" | "save" | null>(null);
+  const [hotkey, setHotkey] = useState("");
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    recorder.getHotkey().then(setHotkey);
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const run = async (kind: "continue" | "save") => {
+    setBusy(kind);
+    try {
+      if (kind === "continue") await recorder.resume(info.meetingId);
+      else await recorder.recover(info.meetingId);
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setBusy(null);
+      onDone();
+    }
+  };
+
+  const stopped = new Date(info.stoppedAt);
+  const mins = Math.max(0, Math.round((now - info.stoppedAt) / 60000));
+  const ago = mins === 0 ? "just now" : mins === 1 ? "1 minute ago" : `${mins} minutes ago`;
+  const recent = now - info.stoppedAt < QUICK_CONTINUE_MS;
+  const shortcut = hotkey.replace("CommandOrControl", navigator.userAgent.includes("Mac") ? "Cmd" : "Ctrl");
+
+  return (
+    <div role="alert" className="mt-6 rounded-lg border border-amber-500/50 bg-amber-500/5 p-4">
+      <div className="flex items-start gap-3">
+        <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium">Recording stopped unexpectedly</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            {info.title || "Untitled meeting"} stopped at{" "}
+            {stopped.toLocaleTimeString(undefined, { timeStyle: "short" })} ({ago}). Everything up to then is
+            safe.
+            {recent && shortcut && ` Press ${shortcut} to continue it.`}
+          </p>
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" onClick={() => run("continue")} disabled={busy !== null}>
+              <Circle className="fill-current text-red-500" aria-hidden />
+              {busy === "continue" ? "Continuing…" : "Continue recording"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => run("save")} disabled={busy !== null}>
+              {busy === "save" ? "Saving…" : "Save what was recorded"}
+            </Button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

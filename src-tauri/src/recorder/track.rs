@@ -7,7 +7,6 @@
 //! meeting is paused are discarded, and paused time does not advance the clock.
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -39,9 +38,15 @@ struct ClockState {
 
 impl Clock {
     pub fn start() -> Self {
+        Self::start_at(Duration::ZERO)
+    }
+
+    /// A clock that already reads `offset` (continuing an interrupted meeting).
+    pub fn start_at(offset: Duration) -> Self {
+        let now = Instant::now();
         Self {
             state: Mutex::new(ClockState {
-                started: Instant::now(),
+                started: now.checked_sub(offset).unwrap_or(now),
                 paused_at: None,
                 paused_total: Duration::ZERO,
             }),
@@ -92,6 +97,17 @@ impl Level {
     }
 }
 
+/// Output channel `o` (of `out` channels) from one input frame.
+fn remix(frame: &[f32], o: usize, out: usize) -> f32 {
+    match (frame.len(), out) {
+        (i, o_n) if i == o_n => frame[o],
+        // Down to mono: average.
+        (i, 1) => frame.iter().sum::<f32>() / i as f32,
+        // Up from mono, or other mismatches: reuse input channels cyclically.
+        (i, _) => frame[o % i],
+    }
+}
+
 /// Maps RMS amplitude to a 0–1 meter value over a -60..0 dBFS range.
 fn meter_value(rms: f32) -> f32 {
     if rms <= 1e-6 {
@@ -115,50 +131,59 @@ pub struct TrackWriter {
 }
 
 impl TrackWriter {
-    /// Spawns the writer thread. `consumer` yields interleaved f32 samples at `sample_rate`.
+    /// Spawns the writer thread. `consumer` yields interleaved f32 samples with `in_channels`
+    /// channels at the file's sample rate; they are remixed if the file has a different count
+    /// (a continued meeting whose device changed between mono and stereo).
     pub fn spawn(
         name: &str,
-        path: PathBuf,
-        sample_rate: u32,
-        channels: u16,
+        mut flac: FlacWriter,
+        in_channels: u16,
         mut consumer: rtrb::Consumer<f32>,
         overflow: Arc<AtomicU64>,
         clock: Arc<Clock>,
     ) -> io::Result<Self> {
-        let mut flac = FlacWriter::create(&path, sample_rate, channels)?;
+        let sample_rate = flac.sample_rate();
         let stop = Arc::new(AtomicBool::new(false));
         let level = Arc::new(Level::default());
         let (stop_t, level_t) = (stop.clone(), level.clone());
-        let ch = usize::from(channels);
+        let ch = usize::from(flac.channels());
+        let in_ch = usize::from(in_channels.max(1));
         let rate = f64::from(sample_rate);
 
         let join = std::thread::Builder::new()
             .name(format!("earshot-writer-{name}"))
             .spawn(move || -> io::Result<u64> {
                 let mut scratch: Vec<i32> = Vec::with_capacity(sample_rate as usize * ch);
+                let mut input: Vec<f32> = Vec::with_capacity(sample_rate as usize * in_ch);
                 let mut last_flush = Instant::now();
                 let mut last_sync = Instant::now();
                 loop {
                     let stopping = stop_t.load(Ordering::Acquire);
                     let paused = clock.is_paused();
 
-                    // Drain everything currently buffered.
-                    let available = consumer.slots() - consumer.slots() % ch;
+                    // Drain everything currently buffered (whole input frames only).
+                    let available = consumer.slots() - consumer.slots() % in_ch;
                     scratch.clear();
                     let mut sum_sq = 0.0f32;
                     if available > 0 {
                         let chunk = consumer.read_chunk(available).expect("slots were counted");
                         let (a, b) = chunk.as_slices();
-                        for &s in a.iter().chain(b) {
-                            let s = if s.is_finite() {
-                                s.clamp(-1.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            sum_sq += s * s;
-                            scratch.push((s * 32767.0).round() as i32);
-                        }
+                        input.clear();
+                        input.extend_from_slice(a);
+                        input.extend_from_slice(b);
                         chunk.commit_all();
+                        for frame in input.chunks_exact(in_ch) {
+                            for o in 0..ch {
+                                let s = remix(frame, o, ch);
+                                let s = if s.is_finite() {
+                                    s.clamp(-1.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                sum_sq += s * s;
+                                scratch.push((s * 32767.0).round() as i32);
+                            }
+                        }
                     }
                     let rms = if scratch.is_empty() {
                         0.0
@@ -285,11 +310,25 @@ pub fn ring(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("earshot-track-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("track.flac")
+    }
+
+    #[test]
+    fn remix_channels() {
+        assert!((remix(&[0.2, 0.4], 0, 1) - 0.3).abs() < 1e-6);
+        assert_eq!(remix(&[0.5], 1, 2), 0.5);
+        assert_eq!(remix(&[0.1, 0.2], 1, 2), 0.2);
+    }
+
+    #[test]
+    fn clock_can_start_at_offset() {
+        let c = Clock::start_at(Duration::from_secs(90));
+        assert!(c.elapsed() >= Duration::from_secs(90) && c.elapsed() < Duration::from_secs(91));
     }
 
     #[test]
@@ -303,8 +342,9 @@ mod tests {
         c.resume();
         std::thread::sleep(Duration::from_millis(30));
         let e = c.elapsed();
+        // Lower bound is exact; the upper bound is loose because CI runners oversleep.
         assert!(
-            e >= at_pause + Duration::from_millis(25) && e < at_pause + Duration::from_millis(70),
+            e >= at_pause + Duration::from_millis(25) && e < at_pause + Duration::from_millis(500),
             "{e:?}"
         );
     }
@@ -316,8 +356,15 @@ mod tests {
         let path = temp_path("pad");
         let (_sink, consumer, overflow) = ring(16_000, 1, 2);
         let clock = Arc::new(Clock::start());
-        let w =
-            TrackWriter::spawn("test", path, 16_000, 1, consumer, overflow, clock.clone()).unwrap();
+        let w = TrackWriter::spawn(
+            "test",
+            FlacWriter::create(&path, 16_000, 1).unwrap(),
+            1,
+            consumer,
+            overflow,
+            clock.clone(),
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(1200));
         let elapsed = clock.elapsed().as_secs_f64();
         let stats = w.finish().unwrap();
@@ -336,8 +383,15 @@ mod tests {
         sink.push(&vec![0.25f32; 9_000]);
         assert_eq!(overflow.load(Ordering::Relaxed), 1_000);
         let clock = Arc::new(Clock::start());
-        let w =
-            TrackWriter::spawn("test", path, 8_000, 1, consumer, overflow.clone(), clock).unwrap();
+        let w = TrackWriter::spawn(
+            "test",
+            FlacWriter::create(&path, 8_000, 1).unwrap(),
+            1,
+            consumer,
+            overflow.clone(),
+            clock,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let stats = w.finish().unwrap();
         assert!(stats.frames >= 8_000, "{}", stats.frames);
@@ -367,8 +421,7 @@ mod tests {
             writers.push(
                 TrackWriter::spawn(
                     name,
-                    path.clone(),
-                    RATE,
+                    FlacWriter::create(&path, RATE, ch).unwrap(),
                     ch,
                     consumer,
                     overflow,

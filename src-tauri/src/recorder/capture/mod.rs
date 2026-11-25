@@ -99,6 +99,15 @@ pub fn prepare_mic(device_id: Option<&str>) -> Result<Prepared, String> {
     cpal_input::prepare_mic(device_id)
 }
 
+/// Opens the mic preferring the given format (continuing an existing track).
+pub fn prepare_mic_like(
+    device_id: Option<&str>,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Prepared, String> {
+    cpal_input::prepare_mic_like(device_id, sample_rate, channels)
+}
+
 /// Opens the meeting-audio source.
 pub fn prepare_system(source: &SystemSource) -> Result<Option<Prepared>, String> {
     match source {
