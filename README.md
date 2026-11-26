@@ -1,118 +1,77 @@
-# Earshot
+<p align="center">
+  <img src="docs/images/icon.png" width="120" alt="Earshot logo">
+</p>
 
-A fully local meeting recorder and transcriber for Windows and macOS. Records your microphone and
-the meeting audio as separate tracks, transcribes them with Whisper, labels speakers with
-open-source diarization, and can summarize with a local model. Nothing leaves the machine.
+<h1 align="center">Earshot</h1>
 
-> Status: feature-complete for v1 (recording, transcription, speaker labels, the meeting player,
-> speaker editing, search, exports, voice profiles, local summaries) and packaged for Windows and
-> macOS. Not yet code-signed; see [Installing an unsigned build](#installing-an-unsigned-build).
+<p align="center">
+  Record your calls, get searchable transcripts with every speaker labelled, and a summary of what was decided, all on your own machine.<br>
+  <sub>Windows · Mac (Apple Silicon and Intel) · by Distraction Digital</sub>
+</p>
 
-## Downloads
+<p align="center">
+  <img src="docs/images/screenshot.png" alt="Earshot showing a quarterly planning call: the audio player with each speaker's turns coloured along the timeline, the transcript with timestamps and named speakers, and the speakers panel with each person's share of the talking">
+</p>
 
-Each release has three installers:
+---
 
-| File | For |
-|---|---|
-| `Earshot_<version>_x64-setup.exe` | Windows. Uses the GPU through Vulkan (NVIDIA, AMD or Intel), otherwise the CPU. |
-| `Earshot_<version>_x64-cuda-setup.exe` | Windows with an NVIDIA GeForce RTX 20-series or newer (driver 580+). Fastest; a larger download because it includes NVIDIA's cuBLAS. |
-| `Earshot_<version>_universal.dmg` | macOS on Apple Silicon or Intel. Uses Metal. |
+Earshot is a meeting recorder for people who would rather be in the conversation than taking notes about it. Start a recording from the app, the tray or a keyboard shortcut, and Earshot keeps your microphone and the meeting's audio as separate tracks. When you stop, it transcribes them, works out who said what, and writes a summary with the decisions and action items.
 
-Both Windows installers install the same app with the same data, so switching is just installing
-the other one. Each keeps updating to its own kind. Models are downloaded inside the app.
+It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) because it records the audio on your computer, with no bot joining the call. And everything happens on your own computer: speech recognition, speaker detection and summaries all run locally on your graphics card or processor. Your recordings and transcripts never leave your machine. There are no accounts, no subscriptions and no per-minute fees.
+
+## Features
+
+- **Recording:** your mic and the meeting audio as two tracks, from all system audio or a single app (Windows). A small floating recorder shows levels, and a global shortcut starts and stops recording from any app. Recordings are written safely as they happen: if the app or computer crashes, everything up to that moment is kept and you can carry on where you left off.
+- **Transcription:** OpenAI's Whisper models, from Tiny to Large V3, with a recommendation for your hardware. Word-level timing, many languages, and GPU acceleration (NVIDIA, AMD, Intel or Apple) with an automatic fallback to the processor.
+- **Speakers:** everything from your mic is you; the meeting audio is split into its separate voices. Rename, merge and reassign speakers, and save a voice so Earshot suggests that person's name in future meetings.
+- **Review:** an audio player synced to the transcript. Click any word to hear it, correct the text in place, and mute either track. Search across every meeting, and export to Markdown, text, SRT, VTT or JSON.
+- **Summaries:** a local AI model (Qwen) writes a summary, decisions, action items and open questions as soon as the transcript is ready. Choose from templates for general meetings, client calls, interviews, one-on-ones and brainstorms, or write your own. Untitled meetings get a short title automatically.
+- **Calm by design:** light and dark themes, keyboard shortcuts throughout, and a guided first run that downloads the right models for your computer.
+
+<p align="center">
+  <img src="docs/images/screenshot-summary.png" alt="The Summary tab of the same meeting: a short summary, the decisions, and action items with an owner for each">
+</p>
+
+## Private by default
+
+- **Local.** Recording, transcription, speaker detection and summaries all run on your computer. Nothing is uploaded and nothing is processed in a data center.
+- **No tracking.** No accounts, analytics or telemetry. Logs stay on your computer.
+- **Little internet use.** The only connections are model downloads you choose (from pinned sources with verified checksums) and a check for new versions of Earshot on GitHub, which you can turn off.
+- **Be considerate.** Recording laws differ by place. Let people know when you record them; Earshot can remind you.
+
+## Download
+
+Installers are on the [Releases](https://github.com/distractiondigital/earshot/releases) page.
+
+| | Installer | Notes |
+|---|---|---|
+| **Windows 10/11** | `Earshot_<version>_x64-setup.exe` | Uses any graphics card through Vulkan (NVIDIA, AMD or Intel), or the processor. |
+| **Windows 10/11, NVIDIA** | `Earshot_<version>_x64-cuda-setup.exe` | Fastest on GeForce RTX 20-series and newer (driver 580 or newer). A larger download because it includes NVIDIA's CUDA libraries. |
+| **Mac** | `Earshot_<version>_universal.dmg` | Apple Silicon and Intel. Recording meeting audio needs macOS 14.6 or newer; older versions record the mic only. |
+
+Both Windows installers install the same app with the same data, so you can switch by installing the other one. Each keeps itself up to date with its own kind.
+
+**Models** are downloaded inside the app, on first run or from Settings: about 1.6 GB for speech recognition and speaker detection, and 1.2 to 5.3 GB for an optional summary model.
 
 ### Installing an unsigned build
 
-Until code-signing certificates are set up, the operating system warns before the first launch:
+Earshot isn't code-signed yet, so your computer warns you the first time:
 
-- **Windows:** SmartScreen shows "Windows protected your PC". Choose **More info → Run anyway**.
-- **macOS:** the app is ad-hoc signed but not notarized, so Gatekeeper blocks it. Open the app
-  once, then go to **System Settings → Privacy & Security** and choose **Open Anyway** (or
-  right-click the app in Finder → **Open**). Earshot then asks for microphone access, and for
-  audio capture when you first record meeting audio.
+- **Windows:** on "Windows protected your PC", click **More info → Run anyway**.
+- **Mac:** open the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway** (or right-click the app in Finder and choose **Open**). Earshot then asks for microphone access, and for audio capture the first time you record meeting audio.
 
-## Development
+## Documentation
 
-Requirements:
+- [Development](docs/DEVELOPMENT.md): running from source, building installers, releases
 
-- Node.js 24+
-- Rust (the toolchain pinned in `rust-toolchain.toml` is installed automatically by rustup)
-- CMake and LLVM/libclang (to build whisper.cpp and llama.cpp for the sidecars)
-- Windows: Visual Studio Build Tools with the C++ workload, WebView2 (preinstalled on Windows 11)
-- macOS: Xcode Command Line Tools
-- Optional GPU backend on Windows: the NVIDIA CUDA Toolkit (13.x) or the Vulkan SDK. The build
-  picks CUDA, then Vulkan, then CPU; `--gpu cuda|vulkan|cpu` (or `EARSHOT_GPU`) chooses one.
+## Credits
 
-On Windows, double-click `dev.cmd` (or run `npm run tauri:dev`) to start "Earshot Dev" with hot
-reload. It uses its own data folder and never updates itself.
+Earshot builds on open work, most of all [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and OpenAI's [Whisper](https://github.com/openai/whisper) models (speech recognition), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with [pyannote](https://github.com/pyannote/pyannote-audio) and [3D-Speaker](https://github.com/modelscope/3D-Speaker) models (telling speakers apart), [llama.cpp](https://github.com/ggml-org/llama.cpp) with the [Qwen](https://github.com/QwenLM) models (summaries), [Tauri](https://tauri.app) and [React](https://react.dev).
 
-The worker links sherpa-onnx (speaker labels) as a prebuilt library. `npm run build:worker`
-downloads it from the sherpa-onnx GitHub release, checks its SHA-256 and extracts it under
-`target/`; run it once before plain `cargo` commands (`cargo test`, `cargo clippy`) that build the
-worker.
+The full list, with licenses, is in [CREDITS.md](CREDITS.md) and under **Settings → About** in the app. Every package that ships with Earshot, with its license text, is in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
-```sh
-npm ci
-npm run tauri:dev      # run "Earshot Dev" with hot reload (separate data folder, no updater)
-npm run build:worker   # build both sidecars (tauri:dev does this too)
-cargo test --workspace # Rust tests
-```
-
-## Releases and updates
-
-Installed copies update themselves from this repository's GitHub releases (signed `latest.json`).
-To ship a version:
-
-```sh
-npm run release -- 0.2.0   # bumps versions, commits, tags v0.2.0
-git push --follow-tags     # CI builds, signs and publishes installers + latest.json
-```
-
-`.github/workflows/release.yml` builds the three installers, then publishes them with a
-`latest.json` that has an entry per updater channel: `windows-x86_64` (standard),
-`windows-x86_64-cuda` (the CUDA build is compiled with `EARSHOT_UPDATER_TARGET` set to it),
-`darwin-aarch64` and `darwin-x86_64`. Running the workflow by hand builds the installers as
-workflow artifacts without publishing anything.
-
-Repository secrets:
-
-| Secret | Needed for |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | Required for tagged releases: signs the updates |
-| `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD` | Optional: Authenticode signing (base64 .pfx) |
-| `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` | Optional: Developer ID signing (base64 .p12) |
-| `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Optional: notarization (app-specific password) |
-
-Without the Windows secrets the installers are unsigned; without the Apple ones the app is
-ad-hoc signed with the hardened runtime and `src-tauri/Entitlements.plist` (microphone), so the
-signed path only adds the certificate and notarization.
-
-Building installers locally (`npm run tauri build`) requires the updater signing key in
-`TAURI_SIGNING_PRIVATE_KEY`; pass `--config '{"bundle":{"createUpdaterArtifacts":false}}'` to skip it.
-On Windows the build copies the Visual C++ runtime (and, for CUDA release builds, cuBLAS; for
-Vulkan builds, the Vulkan loader) into `src-tauri/runtime/`, which is installed next to the app.
-
-## Third-party licenses
-
-`THIRD_PARTY_LICENSES.md` lists every library and runtime that ships with the app, with its
-license text; Settings → About shows the same list. Regenerate both after changing dependencies:
-
-```sh
-node scripts/licenses.mjs          # CI runs it with --check
-```
-
-## Layout
-
-| Path | Contents |
-|---|---|
-| `src/` | React + TypeScript frontend |
-| `src-tauri/` | Tauri app (Rust core: storage, tray, recorder, job supervisor) |
-| `src-tauri/migrations/` | SQLite schema migrations |
-| `crates/earshot-worker/` | Transcription and speaker sidecar (ML runs in separate processes) |
-| `crates/earshot-llm/` | Summary sidecar (llama.cpp; separate because it bundles its own ggml) |
-| `crates/earshot-protocol/` | JSON protocol between the app and the sidecars |
-| `scripts/` | Build helpers; `scripts/ci/` release helpers |
+Earshot was designed by a filmmaker, not a software developer. It was built with AI as a tool, so you can stay present in your conversations and then get back to being creative. We believe AI should be local-first wherever possible. That's why Earshot never sends your information to a data center, and why it will always be open and free.
 
 ## License
 
-MIT
+© 2026 Distraction Digital. Earshot is free and open source software under the [MIT License](LICENSE).

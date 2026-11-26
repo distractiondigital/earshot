@@ -1,6 +1,7 @@
 // Generates the third-party license notices from the dependencies that actually ship:
 //   THIRD_PARTY_LICENSES.md   every package with its license text (bundled with the app)
 //   src/lib/licenses.json     name / version / license / link per package (About → licenses)
+//   CREDITS.md                the About screen's credits (src/lib/credits.ts) as a page
 //
 // Usage: node scripts/licenses.mjs [--check]
 // Sources: `cargo metadata` (normal dependencies of the workspace members, for the Windows and
@@ -155,7 +156,30 @@ const json =
     1,
   ) + "\n";
 
+// ---- CREDITS.md: the About screen's credits (src/lib/credits.ts) as a readable page ----
+const ts = (await import("typescript")).default;
+const creditsJs = ts.transpileModule(readFileSync(join(root, "src", "lib", "credits.ts"), "utf8"), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const { credits, aboutNote } = await import(`data:text/javascript;base64,${Buffer.from(creditsJs).toString("base64")}`);
+const cell = (s) => s.replace(/\|/g, "\\|");
+let creditsMd = `# Credits
+
+Earshot is © 2026 Distraction Digital, free and open source under the MIT License. It is built on the
+work of others; thank you to all of them. The same list is in the app (**Settings → About**), and
+every package that ships with the app, with its license text, is in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+`;
+for (const group of credits) {
+  creditsMd += `\n## ${group.title}\n\n| Component | By | License | What it does |\n|---|---|---|---|\n`;
+  for (const c of group.items) {
+    creditsMd += `| [${cell(c.name)}](${c.url}) | ${cell(c.by)} | ${cell(c.license)} | ${cell(c.note ?? "")} |\n`;
+  }
+}
+creditsMd += `\n---\n\n${aboutNote}\n`;
+
 const outputs = [
+  [join(root, "CREDITS.md"), creditsMd],
   [join(root, "THIRD_PARTY_LICENSES.md"), md],
   [join(root, "src", "lib", "licenses.json"), json],
 ];
