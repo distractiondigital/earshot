@@ -5,6 +5,7 @@ mod hotkey;
 mod models;
 mod pill;
 mod processing;
+mod profiles;
 mod recorder;
 mod speakers;
 mod tray;
@@ -98,6 +99,13 @@ pub fn run() {
             commands::processing_jobs,
             commands::get_transcript,
             commands::meeting_audio,
+            commands::list_profiles,
+            commands::profile_meetings,
+            commands::save_voice_profile,
+            commands::link_voice_profile,
+            commands::unlink_voice_profile,
+            commands::rename_profile,
+            commands::delete_profile,
             commands::search_transcripts,
             commands::export_meeting,
             commands::export_audio,

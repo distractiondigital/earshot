@@ -5,7 +5,7 @@ the meeting audio as separate tracks, transcribes them with Whisper, labels spea
 open-source diarization, and can summarize with a local model. Nothing leaves the machine.
 
 > Status: early development. Recording, transcription, speaker labels, the meeting player, speaker
-> editing, search and exports work; voice profiles are next.
+> editing, search, exports and voice profiles work; summaries are next.
 
 ## Development
 

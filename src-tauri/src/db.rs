@@ -13,6 +13,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/0002_recording.sql")),
         M::up(include_str!("../migrations/0003_source_spec.sql")),
         M::up(include_str!("../migrations/0004_jobs.sql")),
+        M::up(include_str!("../migrations/0005_voice_profiles.sql")),
     ])
 });
 
@@ -71,6 +72,14 @@ pub struct NewSpeaker {
     pub is_me: bool,
     /// Name carried over from before a re-run.
     pub name: Option<String>,
+    /// Voice embedding from speaker separation, with the model that made it.
+    pub embedding: Option<(String, Vec<f32>)>,
+    /// Clean speech that went into the embedding.
+    pub speech_ms: u64,
+    /// Linked voice profile; `auto_matched` when the app suggested it and the user hasn't
+    /// confirmed it yet.
+    pub profile_id: Option<i64>,
+    pub auto_matched: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,6 +145,35 @@ pub struct SpeakerRow {
     pub is_me: bool,
     pub talk_ms: i64,
     pub utterances: i64,
+    /// Linked voice profile and its name.
+    pub profile_id: Option<i64>,
+    pub profile_name: Option<String>,
+    /// The profile was suggested by voice matching and isn't confirmed yet.
+    pub auto_matched: bool,
+    /// A voice embedding is stored, so the speaker can be saved as a profile.
+    pub has_voice: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileRow {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    /// Meetings the profile appears in, and when it was last heard.
+    pub meetings: i64,
+    pub last_seen: Option<i64>,
+    /// Samples for each voice model.
+    pub samples: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileMeeting {
+    pub meeting_id: i64,
+    pub title: String,
+    pub started_at: i64,
+    pub auto_matched: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -476,10 +514,26 @@ impl Db {
         let mut ids = Vec::with_capacity(speakers.len());
         {
             let mut ins_s = tx.prepare(
-                "INSERT INTO speakers (meeting_id, label, is_me, display_name) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO speakers (meeting_id, label, is_me, display_name, embedding,
+                                       embedding_model, speech_ms, profile_id, auto_matched)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for sp in speakers {
-                ins_s.execute(params![meeting_id, sp.label, sp.is_me, sp.name])?;
+                let (model, blob) = match &sp.embedding {
+                    Some((m, v)) => (Some(m.as_str()), Some(crate::profiles::to_blob(v))),
+                    None => (None, None),
+                };
+                ins_s.execute(params![
+                    meeting_id,
+                    sp.label,
+                    sp.is_me,
+                    sp.name,
+                    blob,
+                    model,
+                    sp.speech_ms as i64,
+                    sp.profile_id,
+                    sp.auto_matched
+                ])?;
                 ids.push(tx.last_insert_rowid());
             }
             let mut ins_u = tx.prepare(
@@ -525,8 +579,11 @@ impl Db {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT s.id, s.label, s.display_name, s.is_me,
-                    coalesce(sum(u.end_ms - u.start_ms), 0), count(u.id)
-             FROM speakers s LEFT JOIN utterances u ON u.speaker_id = s.id
+                    coalesce(sum(u.end_ms - u.start_ms), 0), count(u.id),
+                    s.profile_id, p.name, s.auto_matched, s.embedding IS NOT NULL
+             FROM speakers s
+             LEFT JOIN utterances u ON u.speaker_id = s.id
+             LEFT JOIN speaker_profiles p ON p.id = s.profile_id
              WHERE s.meeting_id = ?1
              GROUP BY s.id
              ORDER BY s.is_me DESC, s.id",
@@ -540,6 +597,10 @@ impl Db {
                     is_me: r.get::<_, i64>(3)? != 0,
                     talk_ms: r.get(4)?,
                     utterances: r.get(5)?,
+                    profile_id: r.get(6)?,
+                    profile_name: r.get(7)?,
+                    auto_matched: r.get::<_, i64>(8)? != 0,
+                    has_voice: r.get::<_, i64>(9)? != 0,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -640,34 +701,224 @@ impl Db {
     ) -> Result<Vec<crate::speakers::OldSpeaker>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT s.id, s.display_name, u.start_ms, u.end_ms
+            "SELECT s.id, s.display_name, u.start_ms, u.end_ms,
+                    CASE WHEN s.auto_matched = 0 THEN s.profile_id END
              FROM speakers s JOIN utterances u ON u.speaker_id = s.id
-             WHERE s.meeting_id = ?1 AND s.is_me = 0 AND s.display_name IS NOT NULL
+             WHERE s.meeting_id = ?1 AND s.is_me = 0
+               AND (s.display_name IS NOT NULL OR (s.profile_id IS NOT NULL AND s.auto_matched = 0))
              ORDER BY s.id, u.start_ms",
         )?;
         let mut out: Vec<(i64, crate::speakers::OldSpeaker)> = Vec::new();
         let rows = stmt.query_map([meeting_id], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?;
         for row in rows {
-            let (id, name, s, e) = row?;
+            let (id, name, s, e, profile_id) = row?;
             match out.last_mut() {
                 Some((last, o)) if *last == id => o.spans.push((s, e)),
                 _ => out.push((
                     id,
                     crate::speakers::OldSpeaker {
                         name,
+                        profile_id,
                         spans: vec![(s, e)],
                     },
                 )),
             }
         }
         Ok(out.into_iter().map(|(_, o)| o).collect())
+    }
+
+    // ---- Voice profiles ----
+
+    /// Each profile's averaged voice for one embedding model (profiles without samples for that
+    /// model are left out).
+    pub fn profile_centroids(&self, model: &str) -> Result<Vec<(i64, Vec<f32>)>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT profile_id, vector FROM profile_embeddings WHERE model_id = ?1 ORDER BY profile_id",
+        )?;
+        let mut grouped: Vec<(i64, Vec<Vec<f32>>)> = Vec::new();
+        let rows = stmt.query_map([model], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (id, blob) = row?;
+            let v = crate::profiles::from_blob(&blob);
+            match grouped.last_mut() {
+                Some((last, vs)) if *last == id => vs.push(v),
+                _ => grouped.push((id, vec![v])),
+            }
+        }
+        Ok(grouped
+            .into_iter()
+            .filter_map(|(id, vs)| crate::profiles::centroid(&vs).map(|c| (id, c)))
+            .collect())
+    }
+
+    /// Creates a profile from a meeting speaker's voice and links the speaker to it.
+    pub fn create_profile_from_speaker(&self, speaker_id: i64, name: &str) -> Result<i64, DbError> {
+        let now = now_ms();
+        let id = {
+            let c = self.conn();
+            c.execute(
+                "INSERT INTO speaker_profiles (name, created_at, updated_at) VALUES (?1, ?2, ?2)",
+                params![name, now],
+            )?;
+            c.last_insert_rowid()
+        };
+        if let Err(e) = self.link_speaker_to_profile(speaker_id, id) {
+            let _ = self
+                .conn()
+                .execute("DELETE FROM speaker_profiles WHERE id = ?1", [id]);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Links a meeting speaker to a profile as confirmed, and adds the speaker's voice to the
+    /// profile (newest [`crate::profiles::MAX_SAMPLES`] per model are kept).
+    pub fn link_speaker_to_profile(&self, speaker_id: i64, profile_id: i64) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let (meeting_id, model, blob, speech_ms, is_me): (i64, Option<String>, Option<Vec<u8>>, i64, bool) = tx
+            .query_row(
+                "SELECT meeting_id, embedding_model, embedding, speech_ms, is_me FROM speakers WHERE id = ?1",
+                [speaker_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0)),
+            )
+            .optional()?
+            .ok_or(DbError::Invalid("that speaker doesn't exist"))?;
+        if is_me {
+            return Err(DbError::Invalid(
+                "your own microphone can't have a voice profile",
+            ));
+        }
+        let (Some(model), Some(blob)) = (model, blob) else {
+            return Err(DbError::Invalid(
+                "there isn't enough clear speech from this speaker to save their voice",
+            ));
+        };
+        // One speaker per profile in a meeting.
+        tx.execute(
+            "UPDATE speakers SET profile_id = NULL, auto_matched = 0
+             WHERE meeting_id = ?1 AND profile_id = ?2 AND id != ?3",
+            params![meeting_id, profile_id, speaker_id],
+        )?;
+        tx.execute(
+            "UPDATE speakers SET profile_id = ?2, auto_matched = 0 WHERE id = ?1",
+            params![speaker_id, profile_id],
+        )?;
+        // Replace any earlier sample from this meeting, then keep the newest few.
+        tx.execute(
+            "DELETE FROM profile_embeddings WHERE profile_id = ?1 AND model_id = ?2 AND source_meeting_id = ?3",
+            params![profile_id, model, meeting_id],
+        )?;
+        tx.execute(
+            "INSERT INTO profile_embeddings (profile_id, model_id, vector, source_meeting_id, created_at, speech_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![profile_id, model, blob, meeting_id, now_ms(), speech_ms],
+        )?;
+        tx.execute(
+            "DELETE FROM profile_embeddings WHERE profile_id = ?1 AND model_id = ?2 AND id NOT IN (
+                 SELECT id FROM profile_embeddings WHERE profile_id = ?1 AND model_id = ?2
+                 ORDER BY created_at DESC, id DESC LIMIT ?3)",
+            params![profile_id, model, crate::profiles::MAX_SAMPLES as i64],
+        )?;
+        tx.execute(
+            "UPDATE speaker_profiles SET updated_at = ?2 WHERE id = ?1",
+            params![profile_id, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rejects a suggested match: the speaker goes back to "Speaker N".
+    pub fn unlink_speaker(&self, speaker_id: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE speakers SET profile_id = NULL, auto_matched = 0 WHERE id = ?1",
+            [speaker_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn profiles(&self) -> Result<Vec<ProfileRow>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT p.id, p.name, p.created_at,
+                    (SELECT count(DISTINCT s.meeting_id) FROM speakers s WHERE s.profile_id = p.id),
+                    (SELECT max(m.started_at) FROM speakers s JOIN meetings m ON m.id = s.meeting_id
+                     WHERE s.profile_id = p.id),
+                    (SELECT json_group_array(json_array(model_id, n)) FROM
+                        (SELECT model_id, count(*) AS n FROM profile_embeddings e
+                         WHERE e.profile_id = p.id GROUP BY model_id))
+             FROM speaker_profiles p ORDER BY lower(p.name)",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let samples: Option<String> = r.get(5)?;
+                Ok(ProfileRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    created_at: r.get(2)?,
+                    meetings: r.get(3)?,
+                    last_seen: r.get(4)?,
+                    samples: samples
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn profile_meetings(&self, profile_id: i64) -> Result<Vec<ProfileMeeting>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT m.id, m.title, m.started_at, min(s.auto_matched)
+             FROM speakers s JOIN meetings m ON m.id = s.meeting_id
+             WHERE s.profile_id = ?1
+             GROUP BY m.id ORDER BY m.started_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([profile_id], |r| {
+                Ok(ProfileMeeting {
+                    meeting_id: r.get(0)?,
+                    title: r.get(1)?,
+                    started_at: r.get(2)?,
+                    auto_matched: r.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn rename_profile(&self, profile_id: i64, name: &str) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE speaker_profiles SET name = ?2, updated_at = ?3 WHERE id = ?1",
+            params![profile_id, name, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a profile and its voice samples; meeting speakers linked to it keep their own names.
+    pub fn delete_profile(&self, profile_id: i64) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute(
+            "UPDATE speakers SET auto_matched = 0 WHERE profile_id = ?1",
+            [profile_id],
+        )?;
+        // Speakers' profile_id is cleared by ON DELETE SET NULL; samples go by CASCADE.
+        tx.execute("DELETE FROM speaker_profiles WHERE id = ?1", [profile_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Full-text search over every transcript, newest meetings first. Each word of `query` must
@@ -720,8 +971,10 @@ impl Db {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT u.id, u.track_kind, u.start_ms, u.end_ms, u.text,
-                    u.speaker_id, s.label, s.display_name, coalesce(s.is_me, 0), u.edited
-             FROM utterances u LEFT JOIN speakers s ON s.id = u.speaker_id
+                    u.speaker_id, s.label, coalesce(s.display_name, p.name), coalesce(s.is_me, 0), u.edited
+             FROM utterances u
+             LEFT JOIN speakers s ON s.id = u.speaker_id
+             LEFT JOIN speaker_profiles p ON p.id = s.profile_id
              WHERE u.meeting_id = ?1
              ORDER BY u.start_ms, u.id",
         )?;
@@ -863,16 +1116,28 @@ mod tests {
                 label: "Speaker 1".into(),
                 is_me: false,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
             NewSpeaker {
                 label: "Speaker 2".into(),
                 is_me: false,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
             NewSpeaker {
                 label: "Me".into(),
                 is_me: true,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
         ];
         db.save_transcript(
@@ -979,16 +1244,28 @@ mod tests {
                 label: "Speaker 1".into(),
                 is_me: false,
                 name: Some("Dana".into()),
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
             NewSpeaker {
                 label: "Speaker 2".into(),
                 is_me: false,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
             NewSpeaker {
                 label: "Me".into(),
                 is_me: true,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
         ];
         db.save_transcript(
@@ -1025,7 +1302,7 @@ mod tests {
         );
         let named = db.named_speakers(m).unwrap();
         assert_eq!(named.len(), 1, "unnamed and 'Me' speakers are left out");
-        assert_eq!(named[0].name, "Dana");
+        assert_eq!(named[0].name.as_deref(), Some("Dana"));
         assert_eq!(named[0].spans, [(0, 600), (9000, 9300)]);
     }
 
@@ -1103,6 +1380,113 @@ mod tests {
     }
 
     #[test]
+    fn voice_profiles() {
+        let db = Db::open_in_memory().unwrap();
+        let voice = |x: f32| {
+            Some((
+                "cam".to_owned(),
+                crate::profiles::normalize(vec![x, 1.0 - x, 0.1]),
+            ))
+        };
+        let sp = |label: &str, is_me: bool, embedding: Option<(String, Vec<f32>)>| NewSpeaker {
+            label: label.into(),
+            is_me,
+            name: None,
+            speech_ms: if embedding.is_some() { 20_000 } else { 0 },
+            embedding,
+            profile_id: None,
+            auto_matched: false,
+        };
+        let utt = |speaker: usize, s: i64| NewUtterance {
+            speaker: Some(speaker),
+            start_ms: s,
+            end_ms: s + 1000,
+            text: "hi".into(),
+            words: Vec::new(),
+        };
+        let mut meetings = Vec::new();
+        for i in 0..12 {
+            let m = db.create_meeting(1_000 + i, "m").unwrap();
+            db.save_transcript(
+                m,
+                &[
+                    sp("Speaker 1", false, voice(0.9)),
+                    sp("Speaker 2", false, None),
+                    sp("Me", true, None),
+                ],
+                &[
+                    ("system", &[utt(0, 0), utt(1, 2000)]),
+                    ("mic", &[utt(2, 4000)]),
+                ],
+            )
+            .unwrap();
+            meetings.push(m);
+        }
+        let ids = |m| db.speakers(m).unwrap();
+        let first = ids(meetings[0]);
+        let (me, s1, s2) = (first[0].id, first[1].id, first[2].id);
+        assert!(first[1].has_voice && !first[2].has_voice);
+
+        // Saving needs a voice; the mic speaker can't have a profile.
+        assert!(db.create_profile_from_speaker(me, "Me").is_err());
+        assert!(db.create_profile_from_speaker(s2, "Nobody").is_err());
+        assert!(
+            db.profiles().unwrap().is_empty(),
+            "failed saves leave nothing behind"
+        );
+        let dana = db.create_profile_from_speaker(s1, "Dana").unwrap();
+        let row = &ids(meetings[0])[1];
+        assert_eq!(
+            (
+                row.profile_id,
+                row.profile_name.as_deref(),
+                row.auto_matched
+            ),
+            (Some(dana), Some("Dana"), false)
+        );
+        // The profile's name stands in for "Speaker 1" in the transcript.
+        assert_eq!(
+            db.transcript(meetings[0]).unwrap()[0]
+                .speaker_name
+                .as_deref(),
+            Some("Dana")
+        );
+
+        // Confirming in eleven more meetings keeps only the newest ten samples.
+        for &m in &meetings[1..] {
+            db.link_speaker_to_profile(ids(m)[1].id, dana).unwrap();
+        }
+        let p = &db.profiles().unwrap()[0];
+        assert_eq!(
+            (p.meetings, p.samples.clone()),
+            (12, vec![("cam".to_owned(), 10)])
+        );
+        assert_eq!(db.profile_centroids("cam").unwrap().len(), 1);
+        assert!(db.profile_centroids("other-model").unwrap().is_empty());
+        assert_eq!(db.profile_meetings(dana).unwrap().len(), 12);
+
+        // Confirmed links carry over a re-run; suggestions and rejections don't.
+        let named = db.named_speakers(meetings[0]).unwrap();
+        assert_eq!(
+            (named[0].name.clone(), named[0].profile_id),
+            (None, Some(dana))
+        );
+        db.unlink_speaker(ids(meetings[1])[1].id).unwrap();
+        assert!(db.named_speakers(meetings[1]).unwrap().is_empty());
+
+        db.rename_profile(dana, "Dana R.").unwrap();
+        assert_eq!(ids(meetings[0])[1].profile_name.as_deref(), Some("Dana R."));
+        db.delete_profile(dana).unwrap();
+        assert!(db.profiles().unwrap().is_empty());
+        assert_eq!(
+            ids(meetings[0])[1].profile_id,
+            None,
+            "speakers are unlinked, not deleted"
+        );
+        assert!(db.profile_centroids("cam").unwrap().is_empty());
+    }
+
+    #[test]
     fn migrations_are_valid() {
         MIGRATIONS.validate().unwrap();
     }
@@ -1110,7 +1494,7 @@ mod tests {
     #[test]
     fn migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -1256,11 +1640,19 @@ mod tests {
                 label: "Speaker 1".into(),
                 is_me: false,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
             NewSpeaker {
                 label: "Me".into(),
                 is_me: true,
                 name: None,
+                embedding: None,
+                speech_ms: 0,
+                profile_id: None,
+                auto_matched: false,
             },
         ];
         let mut sys = utt(500, "welcome");

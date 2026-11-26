@@ -65,7 +65,15 @@ export default function App() {
           {screen === "meetings" && openMeeting !== null && (
             <MeetingView id={openMeeting} startAtMs={openAt} onBack={() => setOpenMeeting(null)} />
           )}
-          {screen === "speakers" && <Speakers />}
+          {screen === "speakers" && (
+            <Speakers
+              onOpenMeeting={(id) => {
+                setScreen("meetings");
+                setOpenAt(undefined);
+                setOpenMeeting(id);
+              }}
+            />
+          )}
           {screen === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} />}
         </main>
         <UpdateBanner />

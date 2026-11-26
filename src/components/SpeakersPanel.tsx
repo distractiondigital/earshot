@@ -1,3 +1,4 @@
+import { AudioLines } from "lucide-react";
 import { cn } from "cn";
 import { SpeakerPopover } from "@/components/SpeakerPopover";
 import { speakerColor, speakerDisplayName, type Speaker } from "@/lib/meeting";
@@ -36,8 +37,22 @@ export function SpeakersPanel({
                     <span className={cn("size-2.5 shrink-0 rounded-full", speakerColor(s.label, s.isMe).bg)} aria-hidden />
                     <span className="min-w-0 flex-1 truncate">
                       {speakerDisplayName(s, meName)}
-                      {s.name && !s.isMe && <span className="ml-1 text-xs text-muted-foreground">({s.label})</span>}
+                      {(s.name || s.profileName) && !s.isMe && !s.autoMatched && (
+                        <span className="ml-1 text-xs text-muted-foreground">({s.label})</span>
+                      )}
                     </span>
+                    {s.autoMatched ? (
+                      <span
+                        className="rounded-sm border border-dashed px-1 text-[10px] text-muted-foreground"
+                        title={`Recognised as ${s.profileName}. Click to confirm or reject.`}
+                      >
+                        Suggested
+                      </span>
+                    ) : (
+                      s.profileId && (
+                        <AudioLines className="size-3.5 text-muted-foreground" aria-label="Saved voice" />
+                      )
+                    )}
                     <span className="text-xs text-muted-foreground tabular-nums" title={`${s.utterances} lines`}>
                       {share}%
                     </span>
@@ -49,7 +64,8 @@ export function SpeakersPanel({
         </ul>
       )}
       <p className="mt-3 text-xs text-muted-foreground">
-        Click a speaker to name them or merge them with another. Right-click a line to change its speaker.
+        Click a speaker to name them, save their voice, or merge them with another. Right-click a line to change its
+        speaker.
       </p>
     </section>
   );

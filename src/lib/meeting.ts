@@ -17,7 +17,41 @@ export interface Speaker {
   isMe: boolean;
   talkMs: number;
   utterances: number;
+  /** Linked voice profile. */
+  profileId: number | null;
+  profileName: string | null;
+  /** The profile was suggested by voice matching and isn't confirmed yet. */
+  autoMatched: boolean;
+  /** Enough clear speech was found to save this voice. */
+  hasVoice: boolean;
 }
+
+export interface Profile {
+  id: number;
+  name: string;
+  createdAt: number;
+  meetings: number;
+  lastSeen: number | null;
+  /** [voice model id, sample count] */
+  samples: [string, number][];
+}
+
+export interface ProfileMeeting {
+  meetingId: number;
+  title: string;
+  startedAt: number;
+  autoMatched: boolean;
+}
+
+export const profiles = {
+  list: () => invoke<Profile[]>("list_profiles"),
+  meetings: (id: number) => invoke<ProfileMeeting[]>("profile_meetings", { id }),
+  save: (speakerId: number, name: string) => invoke<number>("save_voice_profile", { speakerId, name }),
+  link: (speakerId: number, profileId: number) => invoke<void>("link_voice_profile", { speakerId, profileId }),
+  unlink: (speakerId: number) => invoke<void>("unlink_voice_profile", { speakerId }),
+  rename: (id: number, name: string) => invoke<void>("rename_profile", { id, name }),
+  remove: (id: number) => invoke<void>("delete_profile", { id }),
+};
 
 export interface SearchHit {
   meetingId: number;
@@ -78,12 +112,12 @@ export function speakerColor(label: string | null, isMe: boolean) {
 }
 
 export function speakerDisplayName(
-  s: { label: string | null; name: string | null; isMe: boolean },
+  s: { label: string | null; name: string | null; isMe: boolean; profileName?: string | null },
   meName: string,
   fallback = "Meeting",
 ) {
   if (s.isMe) return meName;
-  return s.name ?? s.label ?? fallback;
+  return s.name ?? s.profileName ?? s.label ?? fallback;
 }
 
 /** m:ss or h:mm:ss. */

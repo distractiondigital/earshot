@@ -165,14 +165,20 @@ export function Transcript({
             meName,
             u.trackKind === "mic" ? meName : "Meeting",
           );
+          const suggested = !!sp?.autoMatched;
           const fm = firstMark[li];
           const label = (
             <button
               type="button"
-              className={cn("truncate text-left font-medium outline-none hover:underline focus-visible:underline", color.text)}
-              title={sp ? `${name}: rename or merge` : name}
+              className={cn(
+                "truncate text-left font-medium outline-none hover:underline focus-visible:underline",
+                color.text,
+                suggested && "italic",
+              )}
+              title={sp ? (suggested ? `${name}? Recognised by voice; click to confirm` : `${name}: rename or merge`) : name}
             >
               {name}
+              {suggested && "?"}
             </button>
           );
           return (

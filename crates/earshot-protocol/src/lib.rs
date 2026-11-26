@@ -158,6 +158,18 @@ pub struct Diarization {
     pub num_speakers: u32,
     /// Sorted by start time. Turns of different speakers may overlap.
     pub turns: Vec<SpeakerTurn>,
+    /// One voice embedding per speaker (from their clearest speech), for voice profiles.
+    #[serde(default)]
+    pub embeddings: Vec<SpeakerEmbedding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerEmbedding {
+    pub speaker: u32,
+    /// L2-normalized, so the dot product of two embeddings is their cosine similarity.
+    pub vector: Vec<f32>,
+    /// Speech that went into it.
+    pub speech_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -118,7 +118,8 @@ pub fn group(words: &[NewWord], labels: &[Option<u32>]) -> Vec<(Option<u32>, New
 }
 
 /// Renumbers speakers 0, 1, 2… in order of first appearance; returns how many there are.
-pub fn renumber(utterances: &mut [(Option<u32>, NewUtterance)]) -> usize {
+/// Returns the original labels in their new order (`order[new] == old`).
+pub fn renumber(utterances: &mut [(Option<u32>, NewUtterance)]) -> Vec<u32> {
     let mut order: Vec<u32> = Vec::new();
     for (l, _) in utterances.iter_mut() {
         if let Some(s) = l {
@@ -129,24 +130,27 @@ pub fn renumber(utterances: &mut [(Option<u32>, NewUtterance)]) -> usize {
             *s = idx as u32;
         }
     }
-    order.len()
+    order
 }
 
-/// A speaker from before a re-run: the name the user gave it and when it spoke.
+/// A speaker from before a re-run: the name the user gave it, its confirmed voice profile, and
+/// when it spoke.
 pub struct OldSpeaker {
-    pub name: String,
+    pub name: Option<String>,
+    pub profile_id: Option<i64>,
     pub spans: Vec<(i64, i64)>,
 }
 
-/// Carries user-given names over to the speakers of a re-run. A new speaker inherits an old
-/// speaker's name only when each is the other's best match by overlapping speech, and the match
-/// covers at least half of the new speaker's talk time; anything less clean stays "Speaker N".
-/// `new` is (0-based new speaker index, start ms, end ms) for each new utterance.
-pub fn carry_names(
+/// Matches the speakers of a re-run to the old ones, to carry over names and confirmed profiles.
+/// A new speaker gets an old one only when each is the other's best match by overlapping speech,
+/// and the match covers at least half of the new speaker's talk time; anything less clean stays
+/// "Speaker N". `new` is (0-based new speaker index, start ms, end ms) for each new utterance.
+/// Returns, per new speaker, the index of its old speaker.
+pub fn carry_over(
     old: &[OldSpeaker],
     new: &[(Option<usize>, i64, i64)],
     new_count: usize,
-) -> Vec<Option<String>> {
+) -> Vec<Option<usize>> {
     let mut overlap = vec![vec![0i64; old.len()]; new_count];
     let mut talk = vec![0i64; new_count];
     for &(label, start, end) in new {
@@ -173,7 +177,7 @@ pub fn carry_names(
     (0..new_count)
         .map(|i| {
             let j = best_old(i)?;
-            (best_new(j) == Some(i) && overlap[i][j] * 2 >= talk[i]).then(|| old[j].name.clone())
+            (best_new(j) == Some(i) && overlap[i][j] * 2 >= talk[i]).then_some(j)
         })
         .collect()
 }
@@ -326,7 +330,7 @@ mod tests {
     fn speakers_are_numbered_by_first_appearance() {
         let words = [w("a", 0, 100), w("b", 2000, 2100), w("c", 4000, 4100)];
         let mut u = group(&words, &[Some(7), Some(2), Some(7)]);
-        assert_eq!(renumber(&mut u), 2);
+        assert_eq!(renumber(&mut u), [7, 2]);
         assert_eq!(
             u.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
             [Some(0), Some(1), Some(0)]
@@ -334,14 +338,16 @@ mod tests {
     }
 
     #[test]
-    fn names_carry_over_only_on_clean_matches() {
+    fn speakers_carry_over_only_on_clean_matches() {
         let old = [
             OldSpeaker {
-                name: "Dana".into(),
+                name: Some("Dana".into()),
+                profile_id: None,
                 spans: vec![(0, 10_000), (30_000, 40_000)],
             },
             OldSpeaker {
-                name: "Lee".into(),
+                name: Some("Lee".into()),
+                profile_id: Some(7),
                 spans: vec![(10_000, 20_000)],
             },
         ];
@@ -353,13 +359,10 @@ mod tests {
             (Some(1), 30_000, 40_000),
             (Some(2), 39_000, 50_000),
         ];
-        assert_eq!(
-            carry_names(&old, &new, 3),
-            [Some("Lee".to_owned()), Some("Dana".to_owned()), None]
-        );
+        assert_eq!(carry_over(&old, &new, 3), [Some(1), Some(0), None]);
         // Two old speakers merged into one new cluster: only the bigger name carries over.
         let merged = [(Some(0), 0, 20_000), (Some(0), 30_000, 40_000)];
-        assert_eq!(carry_names(&old, &merged, 1), [Some("Dana".to_owned())]);
+        assert_eq!(carry_over(&old, &merged, 1), [Some(0)]);
     }
 
     #[test]

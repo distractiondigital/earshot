@@ -41,6 +41,10 @@ const SETTINGS: &[(&str, Option<&[&str]>)] = &[
     ("speakers.sensitivity", None),
     // Name shown for the mic track's speaker.
     ("speakers.meName", None),
+    // Recognise saved voices in new meetings.
+    ("speakers.autoMatch", Some(&["true", "false"])),
+    // Similarity needed to recognise a voice (0.3–0.95); validated in check_setting.
+    ("speakers.matchThreshold", None),
 ];
 /// Readable but only changed through dedicated commands.
 const READ_ONLY_SETTINGS: &[&str] = &[
@@ -70,6 +74,12 @@ pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String
         && !v.parse::<f32>().is_ok_and(|n| (0.0..=100.0).contains(&n))
     {
         return Err(format!("sensitivity must be 0–100: {v}"));
+    }
+    if key == "speakers.matchThreshold"
+        && let Some(v) = value
+        && !v.parse::<f32>().is_ok_and(|n| (0.3..=0.95).contains(&n))
+    {
+        return Err(format!("match threshold must be 0.3–0.95: {v}"));
     }
     if key == "speakers.meName"
         && let Some(v) = value
@@ -406,6 +416,64 @@ pub fn set_utterance_text(db: State<'_, Db>, id: i64, text: String) -> Result<()
         return Err("That line is too long.".into());
     }
     db.set_utterance_text(id, text).map_err(err)
+}
+
+// ---- Voice profiles ----
+
+fn profile_name(name: &str) -> Result<String, String> {
+    let name: String = name.trim().chars().take(60).collect();
+    if name.is_empty() {
+        return Err("Give the voice a name.".into());
+    }
+    Ok(name)
+}
+
+#[tauri::command]
+pub fn list_profiles(db: State<'_, Db>) -> Result<Vec<crate::db::ProfileRow>, String> {
+    db.profiles().map_err(err)
+}
+
+#[tauri::command]
+pub fn profile_meetings(
+    db: State<'_, Db>,
+    id: i64,
+) -> Result<Vec<crate::db::ProfileMeeting>, String> {
+    db.profile_meetings(id).map_err(err)
+}
+
+/// Saves a meeting speaker's voice as a new profile named `name`.
+#[tauri::command]
+pub fn save_voice_profile(db: State<'_, Db>, speaker_id: i64, name: String) -> Result<i64, String> {
+    db.create_profile_from_speaker(speaker_id, &profile_name(&name)?)
+        .map_err(err)
+}
+
+/// Links a meeting speaker to an existing profile (confirming a suggestion, or "this is …"), and
+/// adds this meeting's voice to the profile.
+#[tauri::command]
+pub fn link_voice_profile(
+    db: State<'_, Db>,
+    speaker_id: i64,
+    profile_id: i64,
+) -> Result<(), String> {
+    db.link_speaker_to_profile(speaker_id, profile_id)
+        .map_err(err)
+}
+
+/// "Not them": removes a suggested (or confirmed) profile link from a meeting speaker.
+#[tauri::command]
+pub fn unlink_voice_profile(db: State<'_, Db>, speaker_id: i64) -> Result<(), String> {
+    db.unlink_speaker(speaker_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn rename_profile(db: State<'_, Db>, id: i64, name: String) -> Result<(), String> {
+    db.rename_profile(id, &profile_name(&name)?).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_profile(db: State<'_, Db>, id: i64) -> Result<(), String> {
+    db.delete_profile(id).map_err(err)
 }
 
 // ---- Search, export, delete ----

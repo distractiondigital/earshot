@@ -484,21 +484,29 @@ fn run_job(
         speakers: speaker_rows,
         tracks: final_tracks,
         removed,
-    } = assemble(&track_words, diarization.as_ref());
+    } = assemble(
+        &track_words,
+        diarization.as_ref(),
+        &models::embedding_choice(app).id,
+    );
     let mut speaker_rows = speaker_rows;
+    // Names and confirmed voice profiles from before a re-run.
     if !old_names.is_empty() {
         let spans: Vec<(Option<usize>, i64, i64)> = final_tracks
             .iter()
             .filter(|(k, _)| k == "system")
             .flat_map(|(_, us)| us.iter().map(|u| (u.speaker, u.start_ms, u.end_ms)))
             .collect();
-        let names = speakers::carry_names(&old_names, &spans, speaker_rows.len());
-        for (row, name) in speaker_rows.iter_mut().zip(names) {
-            if !row.is_me {
-                row.name = name;
+        let carried = speakers::carry_over(&old_names, &spans, speaker_rows.len());
+        for (row, old) in speaker_rows.iter_mut().zip(carried) {
+            if let (false, Some(j)) = (row.is_me, old) {
+                row.name = old_names[j].name.clone();
+                row.profile_id = old_names[j].profile_id;
             }
         }
     }
+    // Recognise saved voices among the rest.
+    match_voice_profiles(&db, &mut speaker_rows);
     if removed > 0 {
         log::info!("removed {removed} mic utterance(s) that echoed the meeting audio");
     }
@@ -557,7 +565,12 @@ struct Assembled {
     removed: usize,
 }
 
-fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>) -> Assembled {
+/// `embedding_model` is the id of the model the diarization embeddings came from.
+fn assemble(
+    tracks: &[(String, Vec<NewWord>)],
+    diarization: Option<&Diarization>,
+    embedding_model: &str,
+) -> Assembled {
     let mut rows = Vec::new();
     let mut out = Vec::new();
     let system = tracks.iter().find(|(k, _)| k == "system");
@@ -575,7 +588,7 @@ fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>
             _ => vec![None; system_words.len()],
         };
         let mut grouped = speakers::group(system_words, &labels);
-        let n = speakers::renumber(&mut grouped);
+        let order = speakers::renumber(&mut grouped);
         system_utts = grouped
             .into_iter()
             .map(|(l, mut u)| {
@@ -583,10 +596,17 @@ fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>
                 u
             })
             .collect();
-        rows.extend((1..=n).map(|i| NewSpeaker {
-            label: format!("Speaker {i}"),
-            is_me: false,
-            name: None,
+        rows.extend(order.iter().enumerate().map(|(i, cluster)| {
+            let emb = diarization.and_then(|d| d.embeddings.iter().find(|e| e.speaker == *cluster));
+            NewSpeaker {
+                label: format!("Speaker {}", i + 1),
+                is_me: false,
+                name: None,
+                embedding: emb.map(|e| (embedding_model.to_owned(), e.vector.clone())),
+                speech_ms: emb.map_or(0, |e| e.speech_ms),
+                profile_id: None,
+                auto_matched: false,
+            }
         }));
     }
 
@@ -597,6 +617,10 @@ fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>
             label: "Me".into(),
             is_me: true,
             name: None,
+            embedding: None,
+            speech_ms: 0,
+            profile_id: None,
+            auto_matched: false,
         });
         let mut mic: Vec<NewUtterance> = speakers::group(words, &vec![None; words.len()])
             .into_iter()
@@ -615,6 +639,69 @@ fn assemble(tracks: &[(String, Vec<NewWord>)], diarization: Option<&Diarization>
         speakers: rows,
         tracks: out,
         removed,
+    }
+}
+
+/// Links unnamed meeting speakers to saved voice profiles they sound like (marked as suggestions
+/// for the user to confirm or reject).
+fn match_voice_profiles(db: &Db, rows: &mut [NewSpeaker]) {
+    if db
+        .get_setting("speakers.autoMatch")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("false")
+    {
+        return;
+    }
+    let threshold = db
+        .get_setting("speakers.matchThreshold")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(crate::profiles::DEFAULT_MATCH_THRESHOLD)
+        .clamp(0.3, 0.95);
+    let Some(model) = rows
+        .iter()
+        .find_map(|r| r.embedding.as_ref().map(|(m, _)| m.clone()))
+    else {
+        return;
+    };
+    let taken: Vec<i64> = rows.iter().filter_map(|r| r.profile_id).collect();
+    let profiles: Vec<(i64, Vec<f32>)> = match db.profile_centroids(&model) {
+        Ok(p) => p
+            .into_iter()
+            .filter(|(id, _)| !taken.contains(id))
+            .collect(),
+        Err(e) => {
+            log::warn!("reading voice profiles failed: {e}");
+            return;
+        }
+    };
+    if profiles.is_empty() {
+        return;
+    }
+    let open: Vec<usize> = (0..rows.len())
+        .filter(|&i| !rows[i].is_me && rows[i].profile_id.is_none() && rows[i].name.is_none())
+        .filter(|&i| rows[i].embedding.is_some())
+        .collect();
+    let candidates: Vec<crate::profiles::Candidate<'_>> = open
+        .iter()
+        .map(|&i| crate::profiles::Candidate {
+            embedding: &rows[i].embedding.as_ref().expect("filtered").1,
+            speech_ms: rows[i].speech_ms,
+        })
+        .collect();
+    let matches = crate::profiles::match_profiles(&candidates, &profiles, threshold);
+    for (&i, m) in open.iter().zip(matches) {
+        if let Some((profile_id, score)) = m {
+            log::info!(
+                "{} sounds like voice profile {profile_id} ({score:.2})",
+                rows[i].label
+            );
+            rows[i].profile_id = Some(profile_id);
+            rows[i].auto_matched = true;
+        }
     }
 }
 
@@ -814,6 +901,7 @@ mod tests {
             audio_ms: 60_000,
             elapsed_ms: 1,
             num_speakers: 2,
+            embeddings: Vec::new(),
             turns: vec![
                 SpeakerTurn {
                     start_ms: 0,
@@ -837,6 +925,7 @@ mod tests {
                 ("system".into(), speakers::words(&system)),
             ],
             Some(&d),
+            "test-model",
         );
         assert_eq!(removed, 0);
         assert_eq!(
@@ -863,7 +952,11 @@ mod tests {
             speakers: rows,
             tracks,
             ..
-        } = assemble(&[("system".into(), speakers::words(&system))], None);
+        } = assemble(
+            &[("system".into(), speakers::words(&system))],
+            None,
+            "test-model",
+        );
         assert!(rows.is_empty());
         assert_eq!(tracks[0].1[0].speaker, None);
     }
@@ -949,7 +1042,7 @@ mod tests {
             speakers: rows,
             tracks,
             removed,
-        } = assemble(&transcripts, Some(&diarization));
+        } = assemble(&transcripts, Some(&diarization), "campplus-en-voxceleb");
         println!("removed as bleed: {removed}");
         let mut all: Vec<(&NewUtterance, &str)> = tracks
             .iter()
