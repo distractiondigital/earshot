@@ -58,9 +58,10 @@ jobs:
     env:
       EARSHOT_GPU: ${{ matrix.gpu }}
       # MSVC: several compilers can share a .pdb in llama.cpp's Vulkan shader-generator sub-build
-      # (error C1041 without /FS). CMake picks these up for every configure, sub-builds included.
-      CFLAGS: ${{ startsWith(matrix.os, 'windows') && '/FS' || '' }}
-      CXXFLAGS: ${{ startsWith(matrix.os, 'windows') && '/FS' || '' }}
+      # (error C1041 without -FS; written with a dash so Git Bash doesn't turn it into a path). CMake
+      # picks these up for every configure, sub-builds included.
+      CFLAGS: ${{ startsWith(matrix.os, 'windows') && '-FS' || '' }}
+      CXXFLAGS: ${{ startsWith(matrix.os, 'windows') && '-FS' || '' }}
       EARSHOT_UPDATER_TARGET: ${{ matrix.updater_target }}
       # CUDA build: Turing (RTX 20) through Blackwell (RTX 50) plus PTX for newer GPUs (CUDA 13
       # no longer supports older cards).
