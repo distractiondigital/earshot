@@ -47,6 +47,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md"
+    },
     "externalBin": [
       "binaries/earshot-worker",
       "binaries/earshot-llm"
@@ -62,7 +65,12 @@
     "shortDescription": "Local meeting recorder and transcriber",
     "copyright": "© 2026 Distraction Digital. MIT License.",
     "publisher": "Distraction Digital",
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": "-"
+    }
   },
   "plugins": {
     "updater": {

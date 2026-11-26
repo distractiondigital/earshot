@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ipc } from "@/lib/ipc";
-import { formatBytes, models, useModels, type Hardware, type ModelView } from "@/lib/models";
+import { formatBytes, gpuBackendName, models, useModels, type Hardware, type ModelView } from "@/lib/models";
 
 const LANGUAGES: [string, string][] = [
   ["auto", "Detect automatically"],
@@ -48,7 +48,7 @@ export function TranscriptionSettings() {
   const standard = visible.filter((m) => !m.advanced);
   const advanced = visible.filter((m) => m.advanced);
   const selected = transcription.find((m) => m.selected);
-  const gpuName = info?.hardware.workerGpu === "cuda" ? "CUDA" : info?.hardware.workerGpu === "metal" ? "Metal" : null;
+  const gpuName = gpuBackendName(info?.hardware.workerGpu);
 
   const card = (m: ModelView) => (
     <ModelCard
@@ -144,7 +144,7 @@ function HardwareLine({ hw }: { hw: Hardware }) {
     : hw.appleSilicon
       ? `Apple Silicon (${formatBytes(hw.ramBytes)} unified memory)`
       : null;
-  const accel = hw.workerGpu === "cuda" ? "CUDA" : hw.workerGpu === "metal" ? "Metal" : null;
+  const accel = gpuBackendName(hw.workerGpu);
   return (
     <p className="flex items-center gap-2 text-sm text-muted-foreground">
       <Cpu className="size-4" aria-hidden />

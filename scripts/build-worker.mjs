@@ -3,18 +3,24 @@
 // expects. They are separate binaries because whisper.cpp and llama.cpp each bundle their own
 // copy of ggml, which can't be linked into one executable.
 //
-// Usage: node scripts/build-worker.mjs [--release] [--target <triple>] [--cpu]
+// Usage: node scripts/build-worker.mjs [--release] [--target <triple>] [--gpu cuda|vulkan|cpu] [--cpu]
 // The Tauri CLI sets TAURI_ENV_TARGET_TRIPLE for before*Command hooks; it is used when present.
 // `universal-apple-darwin` builds both macOS architectures and merges them with `lipo`.
 //
 // GPU backend for whisper.cpp and llama.cpp:
 //   macOS                -> Metal
-//   Windows / Linux      -> CUDA when the CUDA Toolkit is installed (CUDA_PATH or nvcc on PATH),
-//                           otherwise CPU. `--cpu` or EARSHOT_GPU=cpu forces CPU.
+//   Windows / Linux      -> `--gpu <backend>` or EARSHOT_GPU=<backend> when given; otherwise CUDA
+//                           when the CUDA Toolkit is installed (CUDA_PATH or nvcc on PATH), else
+//                           Vulkan when the Vulkan SDK is (VULKAN_SDK), else CPU. `--cpu` = `--gpu cpu`.
 //   CMAKE_CUDA_ARCHITECTURES defaults to "native" (the GPU in this machine); set it to a list
 //   (e.g. "75;80;86;89;120") for builds meant for other machines.
 // GPU builds use their own target directory so switching backends doesn't rebuild whisper.cpp
 // in the main one.
+//
+// Windows: the sidecars link the Visual C++ runtime dynamically, and CUDA builds load cuBLAS.
+// Those DLLs are copied to src-tauri/runtime/, which tauri.windows.conf.json bundles next to the
+// executables, so the installer works on a PC without the VC++ Redistributable or CUDA Toolkit.
+// cuBLAS (~530 MB) is only staged for --release builds; dev runs find it on PATH.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -25,7 +31,11 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const release = args.includes("--release");
-const forceCpu = args.includes("--cpu") || process.env.EARSHOT_GPU === "cpu";
+const gpuIdx = args.indexOf("--gpu");
+const requestedGpu = args.includes("--cpu") ? "cpu" : gpuIdx >= 0 ? args[gpuIdx + 1] : process.env.EARSHOT_GPU || null;
+if (requestedGpu && !["cuda", "vulkan", "cpu"].includes(requestedGpu)) {
+  throw new Error(`Unknown GPU backend "${requestedGpu}" (expected cuda, vulkan or cpu)`);
+}
 const targetIdx = args.indexOf("--target");
 const explicitTarget = targetIdx >= 0 ? args[targetIdx + 1] : process.env.TAURI_ENV_TARGET_TRIPLE;
 const profile = release ? "release" : "debug";
@@ -67,10 +77,21 @@ function cudaToolkit() {
 let features = [];
 const env = { ...process.env };
 let targetDir = join(root, "target");
-if (!forceCpu && triple.includes("apple")) {
-  features = ["metal"];
-} else if (!forceCpu) {
-  const cuda = cudaToolkit();
+let cuda = null;
+if (triple.includes("apple")) {
+  if (requestedGpu !== "cpu") features = ["metal"];
+} else {
+  let gpu = requestedGpu;
+  if (!gpu) gpu = cudaToolkit() ? "cuda" : process.env.VULKAN_SDK ? "vulkan" : "cpu";
+  if (gpu === "cuda") {
+    cuda = cudaToolkit();
+    if (!cuda) throw new Error("--gpu cuda: no CUDA Toolkit found (set CUDA_PATH)");
+  }
+  if (gpu === "vulkan") {
+    if (!process.env.VULKAN_SDK) throw new Error("--gpu vulkan: the Vulkan SDK is not installed (VULKAN_SDK is unset)");
+    features = ["vulkan"];
+    targetDir = join(root, "target", "worker-vulkan");
+  }
   if (cuda) {
     features = ["cuda"];
     targetDir = join(root, "target", "worker-cuda");
@@ -165,3 +186,57 @@ if (triple === "universal-apple-darwin") {
   for (const bin of BINS) copyFileSync(join(dir, `${bin}${ext}`), outPath(bin));
 }
 for (const bin of BINS) console.log(`${bin} -> ${outPath(bin)}`);
+
+/** The newest Visual C++ runtime redistributable folder for an architecture ("x64", "arm64"). */
+function vcRuntimeDir(arch) {
+  const vswhere = join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)", "Microsoft Visual Studio", "Installer", "vswhere.exe");
+  const install = execFileSync(vswhere, ["-latest", "-products", "*", "-property", "installationPath"], { encoding: "utf8" }).trim();
+  const redist = join(install, "VC", "Redist", "MSVC");
+  const versions = readdirSync(redist)
+    .filter((d) => /^\d+\.\d+\.\d+$/.test(d))
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+  for (const v of versions) {
+    const archDir = join(redist, v, arch);
+    if (!existsSync(archDir)) continue;
+    const crt = readdirSync(archDir).find((d) => /^Microsoft\.VC\d+\.CRT$/.test(d));
+    if (crt) return join(archDir, crt);
+  }
+  throw new Error(`No Visual C++ ${arch} runtime found under ${redist}`);
+}
+
+// Runtime DLLs bundled next to the sidecars (see the header). The folder is rebuilt every time so
+// switching backends never leaves another build's DLLs behind.
+if (triple.includes("windows")) {
+  const runtimeDir = join(root, "src-tauri", "runtime");
+  rmSync(runtimeDir, { recursive: true, force: true });
+  mkdirSync(runtimeDir, { recursive: true });
+  const crt = vcRuntimeDir(triple.startsWith("aarch64") ? "arm64" : "x64");
+  const dlls = ["msvcp140.dll", "msvcp140_1.dll", "vcruntime140.dll"];
+  if (!triple.startsWith("aarch64")) dlls.push("vcruntime140_1.dll");
+  for (const dll of dlls) copyFileSync(join(crt, dll), join(runtimeDir, dll));
+  if (features.includes("vulkan") && release) {
+    // The sidecars import vulkan-1.dll, which normally comes with the GPU driver. Shipping the
+    // Khronos loader keeps them starting (and falling back to the CPU) on a PC without one.
+    const sdk = process.env.VULKAN_SDK;
+    const loader = [
+      process.env.EARSHOT_VULKAN_LOADER,
+      join(sdk, "Bin", "vulkan-1.dll"),
+      join(sdk, "..", "runtime", "x64", "vulkan-1.dll"),
+      join(sdk, "runtime", "x64", "vulkan-1.dll"),
+      join(process.env.SystemRoot ?? "C:\\Windows", "System32", "vulkan-1.dll"),
+    ].find((p) => p && existsSync(p));
+    if (!loader) throw new Error("vulkan-1.dll not found (set EARSHOT_VULKAN_LOADER)");
+    copyFileSync(loader, join(runtimeDir, "vulkan-1.dll"));
+  }
+  if (cuda && release) {
+    // CUDA 13 keeps its DLLs in bin\x64, older versions in bin.
+    const bin = [join(cuda, "bin", "x64"), join(cuda, "bin")].find(
+      (d) => existsSync(d) && readdirSync(d).some((f) => /^cublas64_\d+\.dll$/.test(f)),
+    );
+    if (!bin) throw new Error(`No cuBLAS DLL found in ${cuda}`);
+    for (const dll of readdirSync(bin).filter((f) => /^cublas(Lt)?64_\d+\.dll$/.test(f))) {
+      copyFileSync(join(bin, dll), join(runtimeDir, dll));
+    }
+  }
+  console.log(`runtime DLLs -> ${runtimeDir}: ${readdirSync(runtimeDir).join(", ")}`);
+}

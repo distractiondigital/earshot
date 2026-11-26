@@ -38,6 +38,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Third-party licenses are up to date
+        if: runner.os == 'Windows'
+        run: node scripts/licenses.mjs --check
+
       - name: Typecheck and build frontend
         run: npm run build
 

@@ -68,7 +68,7 @@ export function SpeakersSettings() {
         label="Sensitivity"
         hint="Raise it if different people get merged into one speaker; lower it if one person is split into several. Applies to meetings transcribed from now on."
       >
-        <div className="w-56">
+        <div className="w-56 shrink-0">
           <Slider
             min={0}
             max={100}
@@ -78,7 +78,7 @@ export function SpeakersSettings() {
             onValueCommit={([v]) => save("speakers.sensitivity", String(v))}
             aria-label="Speaker sensitivity"
           />
-          <div className="mt-1.5 flex justify-between text-xs whitespace-nowrap text-muted-foreground">
+          <div className="mt-1.5 flex justify-between gap-3 text-xs whitespace-nowrap text-muted-foreground">
             <span>Fewer speakers</span>
             <span>More speakers</span>
           </div>
@@ -99,7 +99,7 @@ export function SpeakersSettings() {
           label="Matching"
           hint="Stricter avoids wrong names but may miss someone on a bad line; more lenient does the opposite."
         >
-          <div className="w-56">
+          <div className="w-56 shrink-0">
             <Slider
               min={0}
               max={100}
@@ -109,7 +109,7 @@ export function SpeakersSettings() {
               onValueCommit={([v]) => save("speakers.matchThreshold", toThreshold(v).toFixed(3))}
               aria-label="Voice matching strictness"
             />
-            <div className="mt-1.5 flex justify-between text-xs whitespace-nowrap text-muted-foreground">
+            <div className="mt-1.5 flex justify-between gap-3 text-xs whitespace-nowrap text-muted-foreground">
               <span>Lenient</span>
               <span>Strict</span>
             </div>

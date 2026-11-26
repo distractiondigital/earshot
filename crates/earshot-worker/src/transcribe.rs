@@ -17,6 +17,8 @@ use crate::{audio, vad};
 pub fn gpu_backend() -> Option<&'static str> {
     if cfg!(feature = "cuda") {
         Some("cuda")
+    } else if cfg!(feature = "vulkan") {
+        Some("vulkan")
     } else if cfg!(feature = "metal") {
         Some("metal")
     } else {

@@ -7,8 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# GPU backends for llama.cpp. CUDA needs the CUDA Toolkit at build time; Metal is macOS-only.
+# GPU backends for llama.cpp. CUDA needs the CUDA Toolkit at build time, Vulkan the Vulkan SDK;
+# Metal is macOS-only.
 cuda = ["llama-cpp-2/cuda"]
+vulkan = ["llama-cpp-2/vulkan"]
 metal = ["llama-cpp-2/metal"]
 
 [dependencies]

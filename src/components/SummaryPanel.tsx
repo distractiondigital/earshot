@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Check, ChevronDown, Copy, Pencil, RotateCw, Sparkles, Square } from "lucide-react";
-import { Markdown } from "@/components/Markdown";
+// The Markdown renderer (react-markdown + remark-gfm) loads with the first summary shown.
+const Markdown = lazy(() => import("@/components/Markdown").then((m) => ({ default: m.Markdown })));
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -86,7 +87,11 @@ export function SummaryPanel({
         {stage?.stage === "notes" && (
           <Progress value={stage.pct} className="mt-3" aria-label="Reading progress" />
         )}
-        {writing && <Markdown text={live} className="mt-4" />}
+        {writing && (
+          <Suspense fallback={<p className="mt-4 text-sm whitespace-pre-wrap">{live}</p>}>
+            <Markdown text={live} className="mt-4" />
+          </Suspense>
+        )}
       </section>
     );
   }
@@ -245,7 +250,9 @@ export function SummaryPanel({
         </p>
       )}
       {notice && !problem && <p className="mt-3 text-sm text-muted-foreground">{notice}</p>}
-      <Markdown text={summary.markdown} className="mt-3" />
+      <Suspense fallback={null}>
+        <Markdown text={summary.markdown} className="mt-3" />
+      </Suspense>
     </section>
   );
 }

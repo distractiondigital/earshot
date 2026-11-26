@@ -749,6 +749,12 @@ fn run_worker(
         Ok(c) => c,
         Err(e) => return WorkerOutcome::Died(e),
     };
+    if matches!(&request, Request::Transcribe { job, .. } if job.backend == Backend::Cpu) {
+        // Hide CUDA devices entirely, so a faulty GPU or driver can't affect a CPU run.
+        cmd.env("CUDA_VISIBLE_DEVICES", "-1");
+        // Vulkan builds: a value with no device index leaves no GPU device.
+        cmd.env("GGML_VK_VISIBLE_DEVICES", "none");
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -101,7 +101,7 @@ pub enum Event {
     Pong {
         id: u64,
         version: String,
-        /// GPU backend compiled into this worker ("cuda", "metal"), if any.
+        /// GPU backend compiled into this worker ("cuda", "vulkan", "metal"), if any.
         gpu_backend: Option<String>,
     },
     Progress {
@@ -174,7 +174,7 @@ pub enum ErrorCode {
 pub struct Transcript {
     /// Detected or requested language (ISO 639-1).
     pub language: String,
-    /// "cuda", "metal" or "cpu".
+    /// "cuda", "vulkan", "metal" or "cpu".
     pub backend_used: String,
     pub audio_ms: u64,
     pub elapsed_ms: u64,
@@ -224,7 +224,7 @@ pub struct Summary {
     /// Markdown, when a template was given.
     pub markdown: Option<String>,
     pub title: Option<String>,
-    /// "cuda", "metal" or "cpu".
+    /// "cuda", "vulkan", "metal" or "cpu".
     pub backend_used: String,
     pub elapsed_ms: u64,
     /// How many parts the transcript was split into (1 = it fit in one pass).

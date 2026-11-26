@@ -1,22 +1,40 @@
 name: Release
 
-# Builds signed installers for a version tag and publishes them, with the updater manifest
+# Builds the installers for a version tag and publishes them, with the updater manifest
 # (latest.json), as a GitHub release of this repository. Installed copies read
 # releases/latest/download/latest.json, so updates only reach users once the repository is public.
 #
-# Required repository secret:
-#   TAURI_SIGNING_PRIVATE_KEY  updater signing key (`tauri signer generate`)
+# Three builds:
+#   windows-x64        standard installer: GPU through Vulkan (any vendor), else CPU
+#   windows-x64-cuda   NVIDIA installer: CUDA, ships cuBLAS (~600 MB); updates on its own channel
+#                      ("windows-x86_64-cuda" in latest.json) so it never "updates" to the standard build
+#   macos-universal    Apple Silicon + Intel, Metal
+#
+# Repository secrets:
+#   TAURI_SIGNING_PRIVATE_KEY      required: updater signing key (`tauri signer generate`)
+#   Optional; each platform is code-signed only when its secrets exist (see README → Releasing):
+#   WINDOWS_CERTIFICATE            base64 .pfx code-signing certificate
+#   WINDOWS_CERTIFICATE_PASSWORD
+#   APPLE_CERTIFICATE              base64 .p12 "Developer ID Application" certificate
+#   APPLE_CERTIFICATE_PASSWORD
+#   APPLE_SIGNING_IDENTITY         e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID   notarization (app-specific password)
 
 on:
   push:
     tags: ["v*"]
+  # A manual run builds and uploads the installers as workflow artifacts without publishing.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CUDA_VERSION: 13.5.0
+  VULKAN_VERSION: 1.4.350.0
 
 jobs:
-  publish:
+  build:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -24,11 +42,27 @@ jobs:
         include:
           - name: windows-x64
             os: windows-latest
-            args: ""
+            gpu: vulkan
+            args: --bundles nsis
+          - name: windows-x64-cuda
+            os: windows-latest
+            gpu: cuda
+            updater_target: windows-x86_64-cuda
+            args: --bundles nsis
           - name: macos-universal
             os: macos-latest
-            args: --target universal-apple-darwin
+            gpu: ""
+            args: --target universal-apple-darwin --bundles app,dmg
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      EARSHOT_GPU: ${{ matrix.gpu }}
+      EARSHOT_UPDATER_TARGET: ${{ matrix.updater_target }}
+      # CUDA build: Turing (RTX 20) through Blackwell (RTX 50) plus PTX for newer GPUs (CUDA 13
+      # no longer supports older cards).
+      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.gpu == 'cuda' && '75-real;80-real;86-real;89-real;120' || '' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -44,22 +78,126 @@ jobs:
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Install Vulkan SDK
+        if: matrix.gpu == 'vulkan'
+        uses: jakoch/install-vulkan-sdk-action@v1.8.1
+        with:
+          vulkan_version: ${{ env.VULKAN_VERSION }}
+          install_runtime: true
+          cache: true
+
+      - name: Put glslc on PATH
+        if: matrix.gpu == 'vulkan'
+        shell: pwsh
+        run: |
+          "$env:VULKAN_SDK\Bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$env:VULKAN_SDK\Bin\glslc.exe" --version
+
+      - name: Install CUDA Toolkit
+        if: matrix.gpu == 'cuda'
+        run: node scripts/ci/install-cuda.mjs ${{ env.CUDA_VERSION }}
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - uses: tauri-apps/tauri-action@action-v1.0.0
+      - name: Prepare Windows code signing
+        if: runner.os == 'Windows'
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $config = '{}'
+          if ($env:WINDOWS_CERTIFICATE) {
+            $pfx = Join-Path $env:RUNNER_TEMP cert.pfx
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $pw = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+            Remove-Item $pfx
+            $config = (@{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } } } | ConvertTo-Json -Compress -Depth 5)
+            Write-Host "Windows code signing: on"
+          } else {
+            Write-Host "Windows code signing: off (no WINDOWS_CERTIFICATE secret)"
+          }
+          "SIGN_CONFIG=$config" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Prepare macOS code signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Without a certificate the app is ad-hoc signed (signingIdentity "-" in tauri.conf.json).
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            } >> "$GITHUB_ENV"
+            echo "SIGN_CONFIG={\"bundle\":{\"macOS\":{\"signingIdentity\":\"$APPLE_SIGNING_IDENTITY\"}}}" >> "$GITHUB_ENV"
+            echo "macOS code signing: on"
+            if [ -n "$APPLE_ID" ]; then
+              { echo "APPLE_ID=$APPLE_ID"; echo "APPLE_PASSWORD=$APPLE_PASSWORD"; echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"; } >> "$GITHUB_ENV"
+              echo "notarization: on"
+            fi
+          else
+            echo 'SIGN_CONFIG={}' >> "$GITHUB_ENV"
+            echo "macOS code signing: ad-hoc (no APPLE_CERTIFICATE secret)"
+          fi
+
+      # Tags need the updater key; a manual test run without it builds installers with no updater files.
+      - name: Build
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then echo "TAURI_SIGNING_PRIVATE_KEY is not set"; exit 1; fi
+            UPDATER_CONFIG='{"bundle":{"createUpdaterArtifacts":false}}'
+          else
+            UPDATER_CONFIG='{}'
+          fi
+          npx tauri build --ci ${{ matrix.args }} --config "$SIGN_CONFIG" --config "$UPDATER_CONFIG"
+
+      - name: Collect installers
+        shell: bash
+        run: node scripts/ci/collect-release.mjs "${{ matrix.name }}" dist-release
+
+      - uses: actions/upload-artifact@v7
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Earshot ${{ github.ref_name }}
-          releaseBody: See the assets below to download and install this version.
-          releaseDraft: false
-          prerelease: false
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
-          args: ${{ matrix.args }}
+          name: release-${{ matrix.name }}
+          if-no-files-found: error
+          path: dist-release/*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: dist-release
+          merge-multiple: true
+
+      - name: Write updater manifest
+        run: node scripts/ci/write-latest-json.mjs dist-release "${{ github.ref_name }}" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist-release/* \
+            --repo "${{ github.repository }}" \
+            --title "Earshot ${{ github.ref_name }}" \
+            --notes-file release-notes.md

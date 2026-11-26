@@ -125,10 +125,15 @@ pub fn transcript_text(lines: &[UtteranceRow], me_name: &str) -> String {
         .iter()
         .filter(|u| !u.text.trim().is_empty())
         .map(|u| {
+            // An unconfirmed voice match isn't a fact the summary should state: use "Speaker N".
+            let name = match (&u.speaker_label, u.speaker_suggested) {
+                (Some(label), true) => label.clone(),
+                _ => crate::export::speaker_name(u, me_name),
+            };
             format!(
                 "[{}] {}: {}",
                 crate::export::timestamp(u.start_ms),
-                crate::export::speaker_name(u, me_name),
+                name,
                 u.text.trim()
             )
         })
@@ -325,6 +330,7 @@ fn run_llm(
     if job.backend == Backend::Cpu {
         // Hide CUDA devices entirely, so a faulty GPU or driver can't affect a CPU run.
         cmd.env("CUDA_VISIBLE_DEVICES", "-1");
+        cmd.env("GGML_VK_VISIBLE_DEVICES", "none");
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -453,6 +459,7 @@ mod tests {
             speaker_id: None,
             speaker_label: label.map(Into::into),
             speaker_name: name.map(Into::into),
+            speaker_suggested: false,
             is_me: me,
             edited: false,
             start_ms: ms,
@@ -487,6 +494,16 @@ mod tests {
         assert_eq!(
             transcript_text(&lines, "Sam"),
             "[0:05] Sam: Morning all.\n[1:05] Dana: Hi.\n[1:02:05] Speaker 2: Hello."
+        );
+    }
+
+    #[test]
+    fn unconfirmed_voice_matches_stay_anonymous() {
+        let mut suggested = utt("system", Some("Speaker 1"), Some("Dana"), false, 0, "Hi.");
+        suggested.speaker_suggested = true;
+        assert_eq!(
+            transcript_text(&[suggested], "Sam"),
+            "[0:00] Speaker 1: Hi."
         );
     }
 

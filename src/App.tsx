@@ -1,11 +1,14 @@
-import { useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { AudioLines, Settings as SettingsIcon, Users } from "lucide-react";
 import { cn } from "cn";
+import { ShortcutsDialog } from "@/components/ShortcutsDialog";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { FOCUS_SEARCH } from "@/lib/events";
 import { MeetingView } from "@/screens/MeetingView";
 import { Meetings } from "@/screens/Meetings";
-import { Speakers } from "@/screens/Speakers";
-import { Settings } from "@/screens/Settings";
+// Settings and Speakers load when first opened, keeping the startup bundle small.
+const Settings = lazy(() => import("@/screens/Settings").then((m) => ({ default: m.Settings })));
+const Speakers = lazy(() => import("@/screens/Speakers").then((m) => ({ default: m.Speakers })));
 
 type Screen = "meetings" | "speakers" | "settings";
 
@@ -21,11 +24,34 @@ export default function App() {
   // Where to start playback when a meeting is opened from a search result.
   const [openAt, setOpenAt] = useState<number | undefined>(undefined);
   const [settingsTab, setSettingsTab] = useState("general");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const go = (s: Screen) => {
     setScreen(s);
     setOpenMeeting(null);
     if (s === "settings") setSettingsTab("general");
   };
+
+  // App-wide shortcuts (the recording hotkey is a global OS shortcut, handled natively).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      const nav: Record<string, Screen> = { "1": "meetings", "2": "speakers", ",": "settings" };
+      if (nav[e.key]) {
+        e.preventDefault();
+        go(nav[e.key]);
+      } else if (e.key === "/") {
+        e.preventDefault();
+        setShortcutsOpen((o) => !o);
+      } else if (e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        go("meetings");
+        // After the list has rendered.
+        setTimeout(() => window.dispatchEvent(new Event(FOCUS_SEARCH)), 0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="flex h-screen bg-background text-foreground select-none">
@@ -49,16 +75,17 @@ export default function App() {
         ))}
       </nav>
       <div className="flex min-w-0 flex-1 flex-col">
-        <main className="flex-1 overflow-y-auto">
+        <main className="flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+          <Suspense fallback={null}>
           {screen === "meetings" && openMeeting === null && (
             <Meetings
               onOpen={(id, atMs) => {
                 setOpenAt(atMs);
                 setOpenMeeting(id);
               }}
-              onSetupTranscription={() => {
+              onOpenSettings={(tab) => {
                 setScreen("settings");
-                setSettingsTab("transcription");
+                setSettingsTab(tab);
               }}
             />
           )}
@@ -82,10 +109,12 @@ export default function App() {
               }}
             />
           )}
-          {screen === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} />}
+          {screen === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} onShowShortcuts={() => setShortcutsOpen(true)} />}
+          </Suspense>
         </main>
         <UpdateBanner />
       </div>
+      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
     </div>
   );
 }

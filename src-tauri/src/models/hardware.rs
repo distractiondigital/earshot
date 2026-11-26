@@ -71,7 +71,7 @@ const GB: u64 = 1024 * 1024 * 1024;
 /// The transcription model to mark "Recommended for this PC".
 pub fn recommend(hw: &Hardware) -> &'static str {
     match hw.worker_gpu.as_deref() {
-        Some("cuda") => match hw.nvidia.as_ref().map(|g| g.vram_bytes) {
+        Some("cuda" | "vulkan") => match hw.nvidia.as_ref().map(|g| g.vram_bytes) {
             Some(v) if v >= 6 * GB => "large-v3-turbo",
             Some(v) if v >= 4 * GB => "large-v3-turbo-q5_0",
             Some(_) => "small-q5_1",
@@ -88,7 +88,7 @@ pub fn recommend(hw: &Hardware) -> &'static str {
 /// context window and the desktop (the GPU is also driving the display).
 pub fn recommend_summary(hw: &Hardware) -> &'static str {
     match hw.worker_gpu.as_deref() {
-        Some("cuda") => match hw.nvidia.as_ref().map(|g| g.vram_bytes) {
+        Some("cuda" | "vulkan") => match hw.nvidia.as_ref().map(|g| g.vram_bytes) {
             Some(v) if v >= 10 * GB => "qwen3.5-9b",
             Some(v) if v >= 5 * GB => "qwen3.5-4b",
             Some(_) => "qwen3.5-2b",

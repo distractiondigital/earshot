@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, Circle, Headphones, Pause, Play, Search, Square, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -8,8 +8,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SearchResults } from "@/components/SearchResults";
+import { Welcome } from "@/components/Welcome";
 import { parseSavedSource, SourceSelect } from "@/components/SourceSelect";
 import { processing, useModels, useProcessing, type Job } from "@/lib/models";
+import { FOCUS_SEARCH } from "@/lib/events";
 import { ipc } from "@/lib/ipc";
 import { summaries } from "@/lib/summary";
 import {
@@ -27,12 +29,18 @@ import {
 
 export function Meetings({
   onOpen,
-  onSetupTranscription,
+  onOpenSettings,
 }: {
   onOpen: (id: number, atMs?: number) => void;
-  onSetupTranscription: () => void;
+  onOpenSettings: (tab: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const focus = () => searchRef.current?.focus();
+    window.addEventListener(FOCUS_SEARCH, focus);
+    return () => window.removeEventListener(FOCUS_SEARCH, focus);
+  }, []);
   const state = useRecorderState();
   const { jobs, live, refresh: refreshJobs } = useProcessing();
   const { info: modelsInfo } = useModels();
@@ -95,17 +103,21 @@ export function Meetings({
       {recording ? (
         <RecordingCard />
       ) : (
-        <RecordControls onError={setError} compact={!!meetings?.length} />
+        <RecordControls
+          onError={setError}
+          compact={meetings === null || meetings.length > 0}
+          welcome={<Welcome onOpenSettings={onOpenSettings} />}
+        />
       )}
 
       {recording && <HeadphonesTip />}
 
-      {!recording && noModel && (
+      {!recording && noModel && !!meetings?.length && (
         <div className="mt-4 flex items-center gap-3 rounded-md bg-muted/60 px-3 py-2 text-sm">
           <p className="flex-1 text-muted-foreground">
             Recordings are saved, but transcription isn't set up yet.
           </p>
-          <Button size="sm" variant="outline" onClick={onSetupTranscription}>
+          <Button size="sm" variant="outline" onClick={() => onOpenSettings("transcription")}>
             Choose a model
           </Button>
         </div>
@@ -115,6 +127,7 @@ export function Meetings({
         <div className="relative mt-6">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
           <Input
+            ref={searchRef}
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -228,7 +241,15 @@ function InterruptedBanner({
 }
 
 
-function RecordControls({ onError, compact }: { onError: (e: string) => void; compact: boolean }) {
+function RecordControls({
+  onError,
+  compact,
+  welcome,
+}: {
+  onError: (e: string) => void;
+  compact: boolean;
+  welcome: React.ReactNode;
+}) {
   const [sources, setSources] = useState<Sources | null>(null);
   const [source, setSource] = useState<SystemSource>({ kind: "all" });
   const [starting, setStarting] = useState(false);
@@ -254,9 +275,9 @@ function RecordControls({ onError, compact }: { onError: (e: string) => void; co
   };
 
   return (
-    <div className={compact ? "mt-6 flex items-center gap-3" : "flex flex-1 flex-col items-center justify-center gap-4"}>
-      {!compact && <p className="text-sm text-muted-foreground">No meetings yet.</p>}
-      <div className="flex items-center gap-2">
+    <div className={compact ? "mt-6 flex items-center gap-3" : "flex flex-1 flex-col items-center justify-center gap-6"}>
+      {!compact && welcome}
+      <div className={compact ? "flex items-center gap-2" : "flex w-full max-w-lg items-center gap-2 pl-8"}>
         <Button size="lg" onClick={start} disabled={starting}>
           <Circle className="fill-current text-red-500" aria-hidden />
           Record

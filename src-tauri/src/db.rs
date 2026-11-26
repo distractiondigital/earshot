@@ -99,8 +99,10 @@ pub struct UtteranceRow {
     pub speaker_id: Option<i64>,
     /// "Me" or "Speaker N"; `None` when the speaker isn't known.
     pub speaker_label: Option<String>,
-    /// Name given by the user (M4).
+    /// Name given by the user (M4), or the linked voice profile's name.
     pub speaker_name: Option<String>,
+    /// `speaker_name` is a voice-match suggestion the user hasn't confirmed.
+    pub speaker_suggested: bool,
     pub is_me: bool,
     /// The text was corrected by hand; word timings may no longer match it.
     pub edited: bool,
@@ -976,7 +978,8 @@ impl Db {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT u.id, u.track_kind, u.start_ms, u.end_ms, u.text,
-                    u.speaker_id, s.label, coalesce(s.display_name, p.name), coalesce(s.is_me, 0), u.edited
+                    u.speaker_id, s.label, coalesce(s.display_name, p.name), coalesce(s.is_me, 0), u.edited,
+                    s.display_name IS NULL AND coalesce(s.auto_matched, 0) != 0
              FROM utterances u
              LEFT JOIN speakers s ON s.id = u.speaker_id
              LEFT JOIN speaker_profiles p ON p.id = s.profile_id
@@ -996,6 +999,7 @@ impl Db {
                     speaker_name: r.get(7)?,
                     is_me: r.get::<_, i64>(8)? != 0,
                     edited: r.get::<_, i64>(9)? != 0,
+                    speaker_suggested: r.get::<_, Option<bool>>(10)?.unwrap_or(false),
                     words: Vec::new(),
                 })
             })?

@@ -51,7 +51,7 @@ export function PlayerBar({
           size="icon-sm"
           variant="ghost"
           aria-label="Back 10 seconds"
-          title="Back 10 seconds (←)"
+          title="Back 10 seconds (Shift+←)"
           onClick={() => p.seek(p.timeMs - 10_000)}
         >
           <RotateCcw aria-hidden />
@@ -69,7 +69,7 @@ export function PlayerBar({
           size="icon-sm"
           variant="ghost"
           aria-label="Forward 10 seconds"
-          title="Forward 10 seconds (→)"
+          title="Forward 10 seconds (Shift+→)"
           onClick={() => p.seek(p.timeMs + 10_000)}
         >
           <RotateCw aria-hidden />

@@ -130,6 +130,8 @@ pub struct AppInfo {
     schema_version: u32,
     data_dir: String,
     worker_version: Option<String>,
+    /// "CUDA" for the NVIDIA build, None for the standard one.
+    flavor: Option<&'static str>,
     /// False for dev builds (`tauri.dev.conf.json`), which must never update themselves.
     updates_enabled: bool,
 }
@@ -154,6 +156,7 @@ pub async fn app_info(app: AppHandle, db: State<'_, Db>) -> Result<AppInfo, Stri
             .to_string(),
         worker_version,
         updates_enabled: !app.config().identifier.ends_with(".dev"),
+        flavor: crate::build_flavor(),
     })
 }
 
@@ -828,6 +831,21 @@ pub fn open_recordings_dir(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(dir.display().to_string(), None::<&str>)
         .map_err(err)
+}
+
+/// Shows the bundled THIRD_PARTY_LICENSES.md (all license texts) in the file manager.
+#[tauri::command]
+pub fn reveal_licenses(app: AppHandle) -> Result<(), String> {
+    use tauri::path::BaseDirectory;
+    use tauri_plugin_opener::OpenerExt;
+    let path = app
+        .path()
+        .resolve("THIRD_PARTY_LICENSES.md", BaseDirectory::Resource)
+        .map_err(err)?;
+    if !path.is_file() {
+        return Err("The license file isn't included in this build.".into());
+    }
+    app.opener().reveal_item_in_dir(path).map_err(err)
 }
 
 /// Opens a web page (the About screen's credit links) in the default browser.

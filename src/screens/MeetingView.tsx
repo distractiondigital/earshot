@@ -102,11 +102,15 @@ export function MeetingView({
         e.preventDefault();
         const step = (e.shiftKey ? 10_000 : 5_000) * (e.key === "ArrowLeft" ? -1 : 1);
         player.seek(player.timeMs + step);
+      } else if (e.key === "Escape" && !e.defaultPrevented) {
+        // Esc closes an open menu, popover or dialog first; only then does it leave the meeting.
+        const overlay = document.querySelector('[role="dialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper]');
+        if (!overlay) onBack();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [player]);
+  }, [player, onBack]);
 
   const job = jobs[id];
   const running = meeting?.status === "processing" || job?.status === "running" || job?.status === "queued";

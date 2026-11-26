@@ -17,6 +17,26 @@ use tauri::{Manager, RunEvent, WindowEvent};
 use crate::db::Db;
 use crate::recorder::Recorder;
 
+/// The updater. Builds of another flavor than the default for their platform (the Windows CUDA
+/// build) are compiled with `EARSHOT_UPDATER_TARGET` set to their own key in latest.json
+/// (e.g. "windows-x86_64-cuda"), so each installer only ever updates to the same flavor.
+fn updater<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R, tauri_plugin_updater::Config> {
+    let builder = tauri_plugin_updater::Builder::new();
+    match option_env!("EARSHOT_UPDATER_TARGET") {
+        Some(target) if !target.is_empty() => builder.target(target),
+        _ => builder,
+    }
+    .build()
+}
+
+/// The build flavor shown in About ("CUDA" for the NVIDIA build), if not the standard one.
+pub fn build_flavor() -> Option<&'static str> {
+    match option_env!("EARSHOT_UPDATER_TARGET") {
+        Some(t) if t.ends_with("-cuda") => Some("CUDA"),
+        _ => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -33,7 +53,7 @@ pub fn run() {
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(updater())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -87,6 +107,7 @@ pub fn run() {
             commands::choose_recordings_dir,
             commands::open_recordings_dir,
             commands::open_link,
+            commands::reveal_licenses,
             commands::get_hotkey,
             commands::set_hotkey,
             commands::list_models,

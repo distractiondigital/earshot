@@ -407,6 +407,7 @@ mod tests {
             speaker_id: Some(1),
             speaker_label: label.map(Into::into),
             speaker_name: name.map(Into::into),
+            speaker_suggested: false,
             is_me,
             edited: false,
             start_ms: start,

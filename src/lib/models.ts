@@ -147,3 +147,9 @@ export function formatBytes(n: number) {
   if (n >= 1024 ** 2) return `${Math.round(n / 1024 ** 2)} MB`;
   return `${Math.max(1, Math.round(n / 1024))} KB`;
 }
+
+/** Display name of a compiled GPU backend ("cuda" → "CUDA"), or null for none. */
+export function gpuBackendName(backend: string | null | undefined): string | null {
+  const names: Record<string, string> = { cuda: "CUDA", vulkan: "Vulkan", metal: "Metal" };
+  return backend ? (names[backend] ?? backend) : null;
+}

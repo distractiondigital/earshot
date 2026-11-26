@@ -7,8 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# GPU backends for whisper.cpp. CUDA needs the CUDA Toolkit at build time; Metal is macOS-only.
+# GPU backends for whisper.cpp. CUDA needs the CUDA Toolkit at build time, Vulkan the Vulkan SDK;
+# Metal is macOS-only.
 cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan"]
 metal = ["whisper-rs/metal"]
 
 [dependencies]

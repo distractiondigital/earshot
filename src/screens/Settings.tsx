@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { LicensesDialog } from "@/components/LicensesDialog";
+import { MOD } from "@/components/ShortcutsDialog";
 import { SettingsRow } from "@/components/SettingsRow";
 import icon from "@/assets/icon.png";
 import { Badge } from "@/components/ui/badge";
@@ -15,7 +17,15 @@ import { SpeakersSettings } from "@/screens/SpeakersSettings";
 import { SummarySettings } from "@/screens/SummarySettings";
 import { TranscriptionSettings } from "@/screens/TranscriptionSettings";
 
-export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => void }) {
+export function Settings({
+  tab,
+  onTab,
+  onShowShortcuts,
+}: {
+  tab: string;
+  onTab: (t: string) => void;
+  onShowShortcuts: () => void;
+}) {
   return (
     <div className="mx-auto max-w-3xl p-8">
       <h1 className="text-lg font-semibold">Settings</h1>
@@ -29,7 +39,7 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
         <TabsContent value="general" className="pt-4">
-          <General />
+          <General onShowShortcuts={onShowShortcuts} />
         </TabsContent>
         <TabsContent value="recording" className="pt-4">
           <RecordingSettings />
@@ -53,9 +63,10 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
 
 const Row = SettingsRow;
 
-function General() {
+function General({ onShowShortcuts }: { onShowShortcuts: () => void }) {
   const { theme, setTheme } = useTheme();
   return (
+    <>
     <Row label="Theme">
       <ToggleGroup
         type="single"
@@ -70,12 +81,19 @@ function General() {
         <ToggleGroupItem value="system">System</ToggleGroupItem>
       </ToggleGroup>
     </Row>
+    <Row label="Keyboard shortcuts" hint={`Show them any time with ${MOD} + /`}>
+      <Button size="sm" variant="outline" onClick={onShowShortcuts}>
+        View
+      </Button>
+    </Row>
+    </>
   );
 }
 
 function About() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [licensesOpen, setLicensesOpen] = useState(false);
   useEffect(() => {
     ipc.appInfo().then(setInfo).catch((e) => setError(String(e)));
   }, []);
@@ -87,7 +105,10 @@ function About() {
         <img src={icon} alt="" className="size-12 rounded-lg" />
         <div>
           <h2 className="text-lg font-semibold">Earshot</h2>
-          <p className="text-sm text-muted-foreground">Version {info.version}</p>
+          <p className="text-sm text-muted-foreground">
+            Version {info.version}
+            {info.flavor && ` · ${info.flavor} build`}
+          </p>
         </div>
       </header>
 
@@ -103,6 +124,12 @@ function About() {
           {info.dataDir}
         </span>
       </Row>
+      <Row label="Open-source licenses" hint="Every library and runtime included in Earshot">
+        <Button size="sm" variant="outline" onClick={() => setLicensesOpen(true)}>
+          View all
+        </Button>
+      </Row>
+      <LicensesDialog open={licensesOpen} onOpenChange={setLicensesOpen} />
 
       {credits.map((group) => (
         <section key={group.title} className="mt-8" aria-labelledby={`credits-${group.title}`}>
