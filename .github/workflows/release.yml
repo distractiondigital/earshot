@@ -78,19 +78,29 @@ jobs:
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      # Vulkan: ggml's vulkan-shaders-gen sub-build nests deep enough to pass Windows' 260-character
-      # path limit (MSVC C1041, MSBuild FTK1011). Build in C:/b and turn off MSBuild file tracking, with
-      # -FS for the shared .pdb that brings, as llama-cpp-sys does for itself (whisper-rs-sys does not).
-      - name: Short build folder
+      # Vulkan sidecars on Windows: ggml's vulkan-shaders-gen sub-build (a CMake ExternalProject) breaks
+      # under MSBuild: its steps run in parallel and out of order, and it nests past Windows' 260-character
+      # path limit under the checkout. So build them with Ninja (as llama.cpp's own CI does), with the
+      # MSVC environment loaded, in a short folder (C:/b), and name MSVC's linker for Rust explicitly
+      # (otherwise Git Bash's /usr/bin/link shadows link.exe on PATH in the build step).
+      - name: Set up MSVC environment
         if: matrix.gpu == 'vulkan'
-        shell: bash
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Use Ninja in a short build folder
+        if: matrix.gpu == 'vulkan'
+        shell: pwsh
         run: |
-          {
-            echo "EARSHOT_WORKER_TARGET_DIR=C:/b"
-            echo "TrackFileAccess=false"
-            echo "CFLAGS=-FS"
-            echo "CXXFLAGS=-FS"
-          } >> "$GITHUB_ENV"
+          $link = Join-Path $env:VCToolsInstallDir "bin/Hostx64/x64/link.exe"
+          if (-not (Test-Path $link)) { throw "MSVC link.exe not found at $link" }
+          @(
+            "CMAKE_GENERATOR=Ninja",
+            "EARSHOT_WORKER_TARGET_DIR=C:/b",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link"
+          ) | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          ninja --version
 
       - name: Install Vulkan SDK
         if: matrix.gpu == 'vulkan'
