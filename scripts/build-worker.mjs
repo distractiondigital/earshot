@@ -188,9 +188,12 @@ async function build(target) {
 
 const outPath = (bin) => join(outDir, `${bin}-${triple}${ext}`);
 if (triple === "universal-apple-darwin") {
-  const dirs = [await build("aarch64-apple-darwin"), await build("x86_64-apple-darwin")];
+  const arches = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+  const dirs = [await build(arches[0]), await build(arches[1])];
   for (const bin of BINS) {
     execFileSync("lipo", ["-create", "-output", outPath(bin), ...dirs.map((d) => join(d, bin))], { stdio: "inherit" });
+    // Tauri compiles the app once per architecture and checks each one's sidecars by name too.
+    arches.forEach((arch, i) => copyFileSync(join(dirs[i], bin), join(outDir, `${bin}-${arch}`)));
   }
 } else {
   const dir = await build(explicitTarget);
