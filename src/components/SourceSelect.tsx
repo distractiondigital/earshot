@@ -79,7 +79,9 @@ export function SourceSelect({
       <SelectTrigger className={className} aria-label="Meeting audio source">
         <SelectValue />
       </SelectTrigger>
-      <SelectContent>
+      {/* Opens below the button: the lists refresh while open (devices come and go), which would make
+          the default item-aligned menu jump. */}
+      <SelectContent position="popper">
         <SelectItem value="all">Default system audio</SelectItem>
         <SelectItem value="none">Microphone only</SelectItem>
         {missing && "name" in value && (
