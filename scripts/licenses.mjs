@@ -160,7 +160,10 @@ const outputs = [
   [join(root, "src", "lib", "licenses.json"), json],
 ];
 if (check) {
-  const stale = outputs.filter(([file, content]) => !existsSync(file) || readFileSync(file, "utf8") !== content);
+  // Line endings may be converted on checkout (Windows), so they are ignored.
+  const stale = outputs.filter(
+    ([file, content]) => !existsSync(file) || readFileSync(file, "utf8").split("\r\n").join("\n") !== content,
+  );
   if (stale.length) {
     console.error(`Out of date: ${stale.map(([f]) => f).join(", ")}. Run: node scripts/licenses.mjs`);
     process.exit(1);
