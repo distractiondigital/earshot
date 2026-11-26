@@ -87,11 +87,16 @@ jobs:
         with:
           arch: x64
 
+      # Also name MSVC's linker for Rust: with the compiler environment loaded, rustc takes
+      # "link.exe" from PATH, where Git Bash's own /usr/bin/link would win in the build step.
       - name: Build with Ninja
         if: matrix.gpu == 'vulkan'
-        shell: bash
+        shell: pwsh
         run: |
-          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          $link = Join-Path $env:VCToolsInstallDir "bin/Hostx64/x64/link.exe"
+          if (-not (Test-Path $link)) { throw "MSVC link.exe not found at $link" }
+          "CMAKE_GENERATOR=Ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           ninja --version
 
       - name: Install Vulkan SDK
