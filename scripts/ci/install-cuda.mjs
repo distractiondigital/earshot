@@ -34,13 +34,26 @@ const work = join(process.env.RUNNER_TEMP ?? process.env.TEMP, "cuda-redist");
 mkdirSync(work, { recursive: true });
 mkdirSync(cudaDir, { recursive: true });
 
-const manifest = await (await fetch(`${BASE}redistrib_${version}.json`)).json();
+/** Fetches a URL into a buffer, retrying dropped connections. */
+async function download(url) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`download failed (${res.status}): ${url}`);
+      return Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      if (attempt >= 4) throw e;
+      console.log(`${e.message}; retrying`);
+      await new Promise((r) => setTimeout(r, attempt * 5000));
+    }
+  }
+}
+
+const manifest = JSON.parse((await download(`${BASE}redistrib_${version}.json`)).toString("utf8"));
 for (const name of COMPONENTS) {
   const entry = manifest[name]?.[PLATFORM];
   if (!entry) throw new Error(`${name} has no ${PLATFORM} archive in CUDA ${version}`);
-  const res = await fetch(BASE + entry.relative_path);
-  if (!res.ok) throw new Error(`download failed (${res.status}): ${entry.relative_path}`);
-  const buf = Buffer.from(await res.arrayBuffer());
+  const buf = await download(BASE + entry.relative_path);
   const sha = createHash("sha256").update(buf).digest("hex");
   if (sha !== entry.sha256) throw new Error(`checksum mismatch for ${name}: ${sha} != ${entry.sha256}`);
   const zip = join(work, `${name}.zip`);
@@ -58,8 +71,12 @@ for (const name of COMPONENTS) {
 // MSBuild integration (what the full installer's "Visual Studio Integration" option does).
 const vswhere = join(process.env["ProgramFiles(x86)"], "Microsoft Visual Studio", "Installer", "vswhere.exe");
 const vs = execFileSync(vswhere, ["-latest", "-products", "*", "-property", "installationPath"], { encoding: "utf8" }).trim();
-const ext = join(cudaDir, "extras", "visual_studio_integration", "MSBuildExtensions");
-if (!existsSync(ext)) throw new Error(`no MSBuildExtensions in ${cudaDir}`);
+// The redistributable archive keeps them in visual_studio_integration/ (the full installer in extras/).
+const ext = [
+  join(cudaDir, "visual_studio_integration", "MSBuildExtensions"),
+  join(cudaDir, "extras", "visual_studio_integration", "MSBuildExtensions"),
+].find(existsSync);
+if (!ext) throw new Error(`no MSBuildExtensions in ${cudaDir}`);
 for (const toolset of readdirSync(join(vs, "MSBuild", "Microsoft", "VC"))) {
   const dest = join(vs, "MSBuild", "Microsoft", "VC", toolset, "BuildCustomizations");
   if (existsSync(dest)) cpSync(ext, dest, { recursive: true, force: true });

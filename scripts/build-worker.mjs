@@ -144,9 +144,20 @@ async function sherpaLibDir(target) {
   if (!existsSync(file) || digest(readFileSync(file)) !== sha256) {
     const url = `https://github.com/k2-fsa/sherpa-onnx/releases/download/v${SHERPA_VERSION}/${stem}.tar.bz2`;
     console.log(`earshot-worker: downloading ${stem}.tar.bz2`);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
-    const buf = Buffer.from(await res.arrayBuffer());
+    // A few tries: CI runners occasionally drop the connection mid-download.
+    let buf;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
+        buf = Buffer.from(await res.arrayBuffer());
+        break;
+      } catch (e) {
+        if (attempt >= 4) throw e;
+        console.log(`earshot-worker: download failed (${e.message}), retrying`);
+        await new Promise((r) => setTimeout(r, attempt * 5000));
+      }
+    }
     const got = digest(buf);
     if (got !== sha256) throw new Error(`Checksum mismatch for ${stem}: expected ${sha256}, got ${got}`);
     writeFileSync(`${file}.part`, buf);

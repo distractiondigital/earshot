@@ -171,7 +171,7 @@ export function Transcript({
             <button
               type="button"
               className={cn(
-                "truncate text-left font-medium outline-none hover:underline focus-visible:underline",
+                "self-start truncate text-left font-medium outline-none hover:underline focus-visible:underline",
                 color.text,
                 suggested && "italic",
               )}
@@ -203,7 +203,7 @@ export function Transcript({
                       {label}
                     </SpeakerPopover>
                   ) : (
-                    <span className={cn("truncate font-medium", color.text)}>{name}</span>
+                    <span className={cn("self-start truncate font-medium", color.text)}>{name}</span>
                   )}
                   {editing === u.id ? (
                     <EditBox initial={u.text} onSave={(t) => saveText(u, t)} onCancel={() => setEditing(null)} />
