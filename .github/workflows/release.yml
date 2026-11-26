@@ -79,11 +79,11 @@ jobs:
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       # Vulkan: ggml's vulkan-shaders-gen sub-build nests deep enough under target/ to pass Windows'
-      # 260-character path limit (MSVC then fails with C1041), so these sidecars build in C:.
+      # 260-character path limit (MSVC then fails with C1041), so these sidecars build in C:/b.
       - name: Short build folder
         if: matrix.gpu == 'vulkan'
-        shell: pwsh
-        run: '"EARSHOT_WORKER_TARGET_DIR=C:" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV'
+        shell: bash
+        run: echo "EARSHOT_WORKER_TARGET_DIR=C:/b" >> "$GITHUB_ENV"
 
       - name: Install Vulkan SDK
         if: matrix.gpu == 'vulkan'

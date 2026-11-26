@@ -108,7 +108,7 @@ if (triple.includes("apple")) {
   }
 }
 // EARSHOT_WORKER_TARGET_DIR overrides it: the Windows Vulkan build nests deeper than the 260-character
-// path limit under a long checkout path (CI uses C:\b).
+// path limit under a long checkout path (CI uses C:/b).
 if (process.env.EARSHOT_WORKER_TARGET_DIR) targetDir = process.env.EARSHOT_WORKER_TARGET_DIR;
 console.log(`sidecars: building with ${features.length ? features.join(", ") : "CPU only"}`);
 
