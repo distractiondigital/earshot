@@ -78,26 +78,12 @@ jobs:
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      # Vulkan: the Visual Studio generator fails in ggml's vulkan-shaders-gen sub-build (C1041, a
-      # shared .pdb); Ninja, as llama.cpp's own CI uses, doesn't. CMAKE_GENERATOR reaches every
-      # CMake configure, sub-builds included. Ninja needs the compiler environment loaded first.
-      - name: Set up MSVC environment
-        if: matrix.gpu == 'vulkan'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      # Also name MSVC's linker for Rust: with the compiler environment loaded, rustc takes
-      # "link.exe" from PATH, where Git Bash's own /usr/bin/link would win in the build step.
-      - name: Build with Ninja
+      # Vulkan: ggml's vulkan-shaders-gen sub-build nests deep enough under target/ to pass Windows'
+      # 260-character path limit (MSVC then fails with C1041), so these sidecars build in C:.
+      - name: Short build folder
         if: matrix.gpu == 'vulkan'
         shell: pwsh
-        run: |
-          $link = Join-Path $env:VCToolsInstallDir "bin/Hostx64/x64/link.exe"
-          if (-not (Test-Path $link)) { throw "MSVC link.exe not found at $link" }
-          "CMAKE_GENERATOR=Ninja" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          ninja --version
+        run: '"EARSHOT_WORKER_TARGET_DIR=C:" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV'
 
       - name: Install Vulkan SDK
         if: matrix.gpu == 'vulkan'
