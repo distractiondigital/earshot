@@ -48,7 +48,8 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/earshot-worker"
+      "binaries/earshot-worker",
+      "binaries/earshot-llm"
     ],
     "icon": [
       "icons/32x32.png",

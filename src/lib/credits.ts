@@ -41,6 +41,20 @@ export const credits: CreditGroup[] = [
         url: "https://onnxruntime.ai",
         note: "Runs the speaker models; part of sherpa-onnx.",
       },
+      {
+        name: "llama.cpp",
+        by: "the ggml authors",
+        license: "MIT",
+        url: "https://github.com/ggml-org/llama.cpp",
+        note: "Runs the summary models, entirely on this computer.",
+      },
+      {
+        name: "llama-cpp-rs",
+        by: "Utility AI and contributors",
+        license: "MIT or Apache-2.0",
+        url: "https://github.com/utilityai/llama-cpp-rs",
+        note: "Connects llama.cpp to the app.",
+      },
     ],
   },
   {
@@ -80,6 +94,13 @@ export const credits: CreditGroup[] = [
         license: "CC-BY-4.0",
         url: "https://huggingface.co/nvidia/speakerverification_en_titanet_large",
         note: "Optional voice model, in the ONNX version published by sherpa-onnx.",
+      },
+      {
+        name: "Qwen3.5 and Qwen3.6",
+        by: "the Qwen team, Alibaba Cloud",
+        license: "Apache-2.0",
+        url: "https://huggingface.co/Qwen",
+        note: "The summary models, in the GGUF versions published by Unsloth.",
       },
     ],
   },
@@ -181,6 +202,13 @@ export const credits: CreditGroup[] = [
         by: "WorkOS",
         license: "MIT",
         url: "https://www.radix-ui.com",
+      },
+      {
+        name: "react-markdown and remark-gfm",
+        by: "Titus Wormer and the unified collective",
+        license: "MIT",
+        url: "https://github.com/remarkjs/react-markdown",
+        note: "Shows summaries.",
       },
       {
         name: "shadcn/ui",

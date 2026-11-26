@@ -18,6 +18,8 @@ pub const SELECTED_SETTING: &str = "transcription.model";
 /// Selected speaker-embedding model id.
 pub const EMBEDDING_SETTING: &str = "speakers.embeddingModel";
 pub const DEFAULT_EMBEDDING: &str = "campplus-en-voxceleb";
+/// Selected summary (LLM) model id.
+pub const SUMMARY_SETTING: &str = "summary.model";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +44,9 @@ pub struct CatalogModel {
     /// Embedding models: clustering distance threshold at the default sensitivity, tuned on AMI.
     #[serde(default)]
     pub cluster_threshold: Option<f32>,
+    /// Summary models: context window to allocate, in tokens.
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +142,16 @@ pub fn selected(app: &AppHandle) -> Option<&'static CatalogModel> {
     find(&id).filter(|m| m.category == "transcription" && is_ready(app, m))
 }
 
+/// The selected summary model, when it's downloaded.
+pub fn summary_model(app: &AppHandle) -> Option<&'static CatalogModel> {
+    let id = app
+        .state::<Db>()
+        .get_setting(SUMMARY_SETTING)
+        .ok()
+        .flatten()?;
+    find(&id).filter(|m| m.category == "summary" && is_ready(app, m))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelView {
@@ -149,9 +164,11 @@ pub struct ModelView {
     pub recommended: bool,
 }
 
-pub fn list(app: &AppHandle, recommended: &str) -> Vec<ModelView> {
+/// `recommended`: one model id per category.
+pub fn list(app: &AppHandle, recommended: &[&str]) -> Vec<ModelView> {
     let downloads = app.state::<download::Downloads>();
     let selected_id = selected(app).map(|m| m.id.clone());
+    let summary_id = summary_model(app).map(|m| m.id.clone());
     let embedding_id = embedding_choice(app).id.as_str();
     catalog()
         .iter()
@@ -169,8 +186,9 @@ pub fn list(app: &AppHandle, recommended: &str) -> Vec<ModelView> {
                 state,
                 downloaded_bytes: progress.unwrap_or(0),
                 selected: selected_id.as_deref() == Some(m.id.as_str())
+                    || summary_id.as_deref() == Some(m.id.as_str())
                     || (m.category == "embedding" && m.id == embedding_id),
-                recommended: m.id == recommended,
+                recommended: recommended.contains(&m.id.as_str()),
             }
         })
         .collect()
@@ -181,6 +199,7 @@ pub fn select(app: &AppHandle, id: &str) -> Result<(), String> {
     let key = match m.category.as_str() {
         "transcription" => SELECTED_SETTING,
         "embedding" => EMBEDDING_SETTING,
+        "summary" => SUMMARY_SETTING,
         _ => return Err(format!("{} can't be selected", m.name)),
     };
     if !is_ready(app, m) {
@@ -203,7 +222,7 @@ pub fn delete(app: &AppHandle, id: &str) -> Result<(), String> {
         }
     }
     let db = app.state::<Db>();
-    for key in [SELECTED_SETTING, EMBEDDING_SETTING] {
+    for key in [SELECTED_SETTING, EMBEDDING_SETTING, SUMMARY_SETTING] {
         if db.get_setting(key).ok().flatten().as_deref() == Some(id) {
             db.set_setting(key, "").map_err(|e| e.to_string())?;
         }
@@ -247,7 +266,7 @@ mod tests {
             assert!(m.url.starts_with("https://huggingface.co/"), "{}", m.id);
             // The URL's last part is the upstream name; `file` is the local name (may differ).
             assert!(
-                m.url.ends_with(".bin") || m.url.ends_with(".onnx"),
+                m.url.ends_with(".bin") || m.url.ends_with(".onnx") || m.url.ends_with(".gguf"),
                 "{}",
                 m.id
             );

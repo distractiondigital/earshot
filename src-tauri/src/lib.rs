@@ -8,6 +8,7 @@ mod processing;
 mod profiles;
 mod recorder;
 mod speakers;
+mod summary;
 mod tray;
 mod worker;
 
@@ -115,6 +116,15 @@ pub fn run() {
             commands::merge_speakers,
             commands::set_utterance_speaker,
             commands::set_utterance_text,
+            commands::get_summary,
+            commands::summary_jobs,
+            commands::summarize_meeting,
+            commands::cancel_summary,
+            commands::edit_summary,
+            commands::list_templates,
+            commands::save_template,
+            commands::delete_template,
+            commands::reset_template,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Earshot");

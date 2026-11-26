@@ -84,6 +84,31 @@ pub fn recommend(hw: &Hardware) -> &'static str {
     }
 }
 
+/// The summary model to recommend: the largest that runs comfortably. Leaves room for the
+/// context window and the desktop (the GPU is also driving the display).
+pub fn recommend_summary(hw: &Hardware) -> &'static str {
+    match hw.worker_gpu.as_deref() {
+        Some("cuda") => match hw.nvidia.as_ref().map(|g| g.vram_bytes) {
+            Some(v) if v >= 10 * GB => "qwen3.5-9b",
+            Some(v) if v >= 5 * GB => "qwen3.5-4b",
+            Some(_) => "qwen3.5-2b",
+            None => cpu_summary(hw),
+        },
+        Some("metal") if hw.ram_bytes >= 16 * GB => "qwen3.5-9b",
+        Some("metal") => "qwen3.5-4b",
+        _ => cpu_summary(hw),
+    }
+}
+
+/// On the CPU, speed matters more than polish: a long meeting is a lot of reading.
+fn cpu_summary(hw: &Hardware) -> &'static str {
+    if hw.cores >= 8 && hw.ram_bytes >= 16 * GB {
+        "qwen3.5-4b"
+    } else {
+        "qwen3.5-2b"
+    }
+}
+
 fn cpu_pick(hw: &Hardware) -> &'static str {
     if hw.cores >= 8 {
         "small-q5_1"
@@ -131,5 +156,30 @@ mod tests {
             "large-v3-turbo-q5_0"
         );
         assert_eq!(recommend(&hw(None, None, 8, 4)), "base-q5_1");
+    }
+
+    #[test]
+    fn summary_recommendations() {
+        assert_eq!(
+            recommend_summary(&hw(Some("cuda"), Some(16), 32, 16)),
+            "qwen3.5-9b"
+        );
+        assert_eq!(
+            recommend_summary(&hw(Some("cuda"), Some(8), 32, 16)),
+            "qwen3.5-4b"
+        );
+        assert_eq!(
+            recommend_summary(&hw(Some("cuda"), Some(4), 16, 8)),
+            "qwen3.5-2b"
+        );
+        assert_eq!(
+            recommend_summary(&hw(Some("metal"), None, 16, 10)),
+            "qwen3.5-9b"
+        );
+        assert_eq!(recommend_summary(&hw(None, None, 16, 8)), "qwen3.5-4b");
+        assert_eq!(recommend_summary(&hw(None, None, 8, 4)), "qwen3.5-2b");
+        for id in ["qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"] {
+            assert!(crate::models::find(id).is_some_and(|m| m.category == "summary"));
+        }
     }
 }

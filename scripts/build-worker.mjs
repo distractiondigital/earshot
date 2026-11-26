@@ -1,11 +1,13 @@
-// Builds the earshot-worker sidecar and copies it to src-tauri/binaries/ with the
-// target-triple suffix that Tauri's `externalBin` expects.
+// Builds the sidecars -- earshot-worker (transcription, speakers) and earshot-llm (summaries) --
+// and copies them to src-tauri/binaries/ with the target-triple suffix that Tauri's `externalBin`
+// expects. They are separate binaries because whisper.cpp and llama.cpp each bundle their own
+// copy of ggml, which can't be linked into one executable.
 //
 // Usage: node scripts/build-worker.mjs [--release] [--target <triple>] [--cpu]
 // The Tauri CLI sets TAURI_ENV_TARGET_TRIPLE for before*Command hooks; it is used when present.
 // `universal-apple-darwin` builds both macOS architectures and merges them with `lipo`.
 //
-// GPU backend for whisper.cpp:
+// GPU backend for whisper.cpp and llama.cpp:
 //   macOS                -> Metal
 //   Windows / Linux      -> CUDA when the CUDA Toolkit is installed (CUDA_PATH or nvcc on PATH),
 //                           otherwise CPU. `--cpu` or EARSHOT_GPU=cpu forces CPU.
@@ -36,7 +38,7 @@ const hostTriple = execFileSync("rustc", ["-vV"], { encoding: "utf8" })
 const triple = explicitTarget || hostTriple;
 const ext = triple.includes("windows") ? ".exe" : "";
 const outDir = join(root, "src-tauri", "binaries");
-const out = join(outDir, `earshot-worker-${triple}${ext}`);
+const BINS = ["earshot-worker", "earshot-llm"];
 mkdirSync(outDir, { recursive: true });
 
 /** Finds an installed CUDA Toolkit directory, or null. */
@@ -77,12 +79,14 @@ if (!forceCpu && triple.includes("apple")) {
     const m = /^v(\d+)\.(\d+)$/.exec(basename(cuda));
     if (m) env[`CUDA_PATH_V${m[1]}_${m[2]}`] = cuda;
     env.CMAKE_CUDA_ARCHITECTURES ??= "native";
+    // llama.cpp's build reads CMake's own variable for this.
+    env.CUDAARCHS ??= env.CMAKE_CUDA_ARCHITECTURES;
     // On Windows the variable is usually spelled "Path"; a copied env object is case-sensitive.
     const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
     env[pathKey] = `${join(cuda, "bin")}${process.platform === "win32" ? ";" : ":"}${env[pathKey] ?? ""}`;
   }
 }
-console.log(`earshot-worker: building with ${features.length ? features.join(", ") : "CPU only"}`);
+console.log(`sidecars: building with ${features.length ? features.join(", ") : "CPU only"}`);
 
 // sherpa-onnx (speaker diarization) links a prebuilt static library. sherpa-onnx-sys would download
 // it at build time without checking it, and on Windows it picks the build that uses the static C
@@ -138,23 +142,26 @@ async function sherpaLibDir(target) {
   return libDir;
 }
 
-/** Builds for one target (or the host when `target` is undefined) and returns the binary path. */
+/** Builds both sidecars for one target (or the host when `target` is undefined); returns the
+ * directory holding the binaries. */
 async function build(target) {
   const libDir = await sherpaLibDir(target ?? triple);
-  const cargoArgs = ["build", "-p", "earshot-worker", "--target-dir", targetDir];
+  const cargoArgs = ["build", ...BINS.flatMap((b) => ["-p", b]), "--target-dir", targetDir];
   if (release) cargoArgs.push("--release");
   if (target) cargoArgs.push("--target", target);
-  if (features.length) cargoArgs.push("--features", features.join(","));
+  if (features.length) cargoArgs.push("--features", BINS.flatMap((b) => features.map((f) => `${b}/${f}`)).join(","));
   execFileSync("cargo", cargoArgs, { cwd: root, stdio: "inherit", env: { ...env, SHERPA_ONNX_LIB_DIR: libDir } });
-  return target
-    ? join(targetDir, target, profile, `earshot-worker${ext}`)
-    : join(targetDir, profile, `earshot-worker${ext}`);
+  return target ? join(targetDir, target, profile) : join(targetDir, profile);
 }
 
+const outPath = (bin) => join(outDir, `${bin}-${triple}${ext}`);
 if (triple === "universal-apple-darwin") {
-  const parts = [await build("aarch64-apple-darwin"), await build("x86_64-apple-darwin")];
-  execFileSync("lipo", ["-create", "-output", out, ...parts], { stdio: "inherit" });
+  const dirs = [await build("aarch64-apple-darwin"), await build("x86_64-apple-darwin")];
+  for (const bin of BINS) {
+    execFileSync("lipo", ["-create", "-output", outPath(bin), ...dirs.map((d) => join(d, bin))], { stdio: "inherit" });
+  }
 } else {
-  copyFileSync(await build(explicitTarget), out);
+  const dir = await build(explicitTarget);
+  for (const bin of BINS) copyFileSync(join(dir, `${bin}${ext}`), outPath(bin));
 }
-console.log(`earshot-worker -> ${out}`);
+for (const bin of BINS) console.log(`${bin} -> ${outPath(bin)}`);

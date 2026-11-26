@@ -1,0 +1,17 @@
+[package]
+name = "earshot-llm"
+description = "Earshot summary sidecar (llama.cpp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# GPU backends for llama.cpp. CUDA needs the CUDA Toolkit at build time; Metal is macOS-only.
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+
+[dependencies]
+earshot-protocol = { path = "../earshot-protocol" }
+serde_json.workspace = true
+llama-cpp-2 = { version = "=0.1.161", default-features = false }

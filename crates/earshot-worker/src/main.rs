@@ -77,6 +77,14 @@ fn handle(
             diarize::run(&job, cancel, progress)
                 .map(|diarization| Event::Diarization { id, diarization })
         }),
+        Request::Summarize { id, .. } => {
+            let _ = out.send(Out::from(error(
+                id,
+                ErrorCode::BadRequest,
+                "summaries run in earshot-llm",
+            )));
+            None
+        }
     }
 }
 

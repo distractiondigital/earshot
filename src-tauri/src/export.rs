@@ -59,6 +59,8 @@ pub struct Doc<'a> {
     pub me_name: &'a str,
     /// Local date and time of the meeting, already formatted.
     pub when: String,
+    /// The meeting's summary (Markdown), if it has one.
+    pub summary: Option<&'a str>,
 }
 
 impl Doc<'_> {
@@ -68,14 +70,24 @@ impl Doc<'_> {
     }
 
     fn speaker(&self, u: &UtteranceRow) -> String {
-        if u.is_me || (u.speaker_label.is_none() && u.track_kind == "mic") {
-            return self.me_name.to_owned();
-        }
-        u.speaker_name
-            .clone()
-            .or_else(|| u.speaker_label.clone())
-            .unwrap_or_else(|| "Meeting".to_owned())
+        speaker_name(u, self.me_name)
     }
+}
+
+/// Who said an utterance, as shown in exports and given to the summary model.
+pub fn speaker_name(u: &UtteranceRow, me_name: &str) -> String {
+    if u.is_me || (u.speaker_label.is_none() && u.track_kind == "mic") {
+        return me_name.to_owned();
+    }
+    u.speaker_name
+        .clone()
+        .or_else(|| u.speaker_label.clone())
+        .unwrap_or_else(|| "Meeting".to_owned())
+}
+
+/// m:ss or h:mm:ss.
+pub fn timestamp(ms: i64) -> String {
+    stamp(ms)
 }
 
 pub fn render(doc: &Doc<'_>, format: Format) -> String {
@@ -124,7 +136,11 @@ fn markdown(doc: &Doc<'_>) -> String {
                 .join(" "),
         );
     }
-    out.push_str(&format!("{}\n\n## Transcript\n\n", meta.join(" · ")));
+    out.push_str(&format!("{}\n\n", meta.join(" · ")));
+    if let Some(summary) = doc.summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("## Summary\n\n{}\n\n", nest_headings(summary)));
+    }
+    out.push_str("## Transcript\n\n");
     for u in doc.lines {
         out.push_str(&format!(
             "**[{}] {}:** {}\n\n",
@@ -136,8 +152,25 @@ fn markdown(doc: &Doc<'_>) -> String {
     out
 }
 
+/// Moves a summary's headings one level down, to sit under the export's "## Summary".
+fn nest_headings(md: &str) -> String {
+    md.lines()
+        .map(|l| {
+            if l.starts_with('#') {
+                format!("#{l}")
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn text(doc: &Doc<'_>) -> String {
     let mut out = format!("{}\n{}\n\n", doc.title(), doc.when);
+    if let Some(summary) = doc.summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("{summary}\n\n---\n\n"));
+    }
     for u in doc.lines {
         out.push_str(&format!(
             "[{}] {}: {}\n",
@@ -257,6 +290,8 @@ struct JsonDoc<'a> {
     duration_ms: i64,
     language: Option<&'a str>,
     tags: &'a [String],
+    /// Markdown.
+    summary: Option<&'a str>,
     utterances: Vec<JsonUtterance<'a>>,
 }
 
@@ -289,6 +324,7 @@ fn json(doc: &Doc<'_>) -> String {
         duration_ms: doc.meeting.duration_ms,
         language: doc.meeting.language.as_deref(),
         tags: &doc.meeting.tags,
+        summary: doc.summary,
         utterances: doc
             .lines
             .iter()
@@ -416,6 +452,7 @@ mod tests {
             lines: &lines,
             me_name: "Sam",
             when: "Nov 25, 2026, 10:00".into(),
+            summary: Some("## Decisions\n- Ship it."),
         };
         let md = render(&doc, Format::Markdown);
         assert!(
@@ -424,6 +461,7 @@ mod tests {
         );
         assert!(md.contains("**[0:01] Dana:** Hello <team>.\n"));
         assert!(md.contains("**[1:02:05] Sam:** Thanks\n"));
+        assert!(md.contains("## Summary\n\n### Decisions\n- Ship it.\n\n## Transcript\n"));
         let txt = render(&doc, Format::Text);
         assert!(
             txt.contains("[0:01] Dana: Hello <team>.\n[1:02:05] Sam: Thanks\n"),
@@ -440,6 +478,7 @@ mod tests {
             lines: &lines,
             me_name: "Sam",
             when: String::new(),
+            summary: None,
         };
         let srt = render(&doc, Format::Srt);
         assert!(
@@ -471,6 +510,7 @@ mod tests {
             lines: &lines,
             me_name: "Me",
             when: String::new(),
+            summary: None,
         };
         let cues = cues(&doc);
         assert!(cues.len() >= 3);
@@ -500,6 +540,7 @@ mod tests {
             lines: &lines,
             me_name: "Sam",
             when: String::new(),
+            summary: None,
         };
         let v: serde_json::Value = serde_json::from_str(&render(&doc, Format::Json)).unwrap();
         assert_eq!(v["utterances"][0]["speaker"], "Dana");

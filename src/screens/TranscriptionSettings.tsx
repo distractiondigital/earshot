@@ -6,7 +6,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { ipc } from "@/lib/ipc";
 import { formatBytes, models, useModels, type Hardware, type ModelView } from "@/lib/models";
 
@@ -34,14 +33,12 @@ export function TranscriptionSettings() {
   const { info, progress, errors } = useModels();
   const [language, setLanguage] = useState("auto");
   const [backend, setBackend] = useState("auto");
-  const [auto, setAuto] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     ipc.getSetting("transcription.language").then((v) => v && setLanguage(v));
     ipc.getSetting("transcription.backend").then((v) => v && setBackend(v));
-    ipc.getSetting("transcription.autoProcess").then((v) => setAuto(v !== "false"));
   }, []);
 
   const save = (key: string, value: string) => ipc.setSetting(key, value).catch((e) => setError(String(e)));
@@ -109,7 +106,10 @@ export function TranscriptionSettings() {
             </SelectContent>
           </Select>
         </SettingsRow>
-        <SettingsRow label="Compute" hint="Auto uses the GPU when available and falls back to the CPU if it fails.">
+        <SettingsRow
+          label="Compute"
+          hint="For transcription and summaries. Auto uses the GPU when available and falls back to the CPU if it fails."
+        >
           <Select
             value={backend}
             onValueChange={(v) => {
@@ -126,16 +126,6 @@ export function TranscriptionSettings() {
               <SelectItem value="cpu">CPU</SelectItem>
             </SelectContent>
           </Select>
-        </SettingsRow>
-        <SettingsRow label="Transcribe automatically after recording">
-          <Switch
-            checked={auto}
-            onCheckedChange={(v) => {
-              setAuto(v);
-              save("transcription.autoProcess", String(v));
-            }}
-            aria-label="Transcribe automatically after recording"
-          />
         </SettingsRow>
       </div>
 

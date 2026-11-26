@@ -5,9 +5,11 @@ import { MeetingMenu } from "@/components/MeetingMenu";
 import { PlayerBar } from "@/components/PlayerBar";
 import { RerunMenu } from "@/components/RerunMenu";
 import { SpeakersPanel } from "@/components/SpeakersPanel";
+import { SummaryPanel } from "@/components/SummaryPanel";
 import { Transcript } from "@/components/Transcript";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ipc } from "@/lib/ipc";
 import { meeting as meetingApi, useSyncedPlayer, type Speaker, type TrackAudio } from "@/lib/meeting";
 import { processing, useProcessing, type Utterance } from "@/lib/models";
@@ -24,7 +26,18 @@ function typingInto(target: EventTarget | null) {
 }
 
 /** One meeting: player, transcript with speakers, and editing. */
-export function MeetingView({ id, onBack, startAtMs }: { id: number; onBack: () => void; startAtMs?: number }) {
+export function MeetingView({
+  id,
+  onBack,
+  startAtMs,
+  onOpenSettings,
+}: {
+  id: number;
+  onBack: () => void;
+  startAtMs?: number;
+  /** Opens a Settings tab. */
+  onOpenSettings: (tab: string) => void;
+}) {
   const [meeting, setMeeting] = useState<Meeting | null>(null);
   const [lines, setLines] = useState<Utterance[] | null>(null);
   const [speakers, setSpeakers] = useState<Speaker[]>([]);
@@ -33,11 +46,14 @@ export function MeetingView({ id, onBack, startAtMs }: { id: number; onBack: () 
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [meName, setMeName] = useState(DEFAULT_ME_NAME);
+  const [summariesOn, setSummariesOn] = useState(true);
+  const [tab, setTab] = useState("transcript");
   const { jobs, live } = useProcessing();
   const player = useSyncedPlayer(tracks);
 
   useEffect(() => {
     ipc.getSetting("speakers.meName").then((v) => v && setMeName(v));
+    ipc.getSetting("summary.mode").then((v) => setSummariesOn(v !== "never"));
   }, []);
 
   const loadTranscript = useCallback(() => {
@@ -56,9 +72,13 @@ export function MeetingView({ id, onBack, startAtMs }: { id: number; onBack: () 
   useEffect(() => {
     load();
     meetingApi.audio(id).then(setTracks).catch((e) => setError(String(e)));
-    const un = listen<number>("processing://changed", (e) => e.payload === id && load());
+    // A summary job can also give the meeting its title.
+    const subs = [
+      listen<number>("processing://changed", (e) => e.payload === id && load()),
+      listen<number>("summary://changed", (e) => e.payload === id && load()),
+    ];
     return () => {
-      un.then((f) => f());
+      subs.forEach((u) => u.then((f) => f()));
     };
   }, [id, load]);
 
@@ -172,21 +192,36 @@ export function MeetingView({ id, onBack, startAtMs }: { id: number; onBack: () 
       {lines && lines.length === 0 && !running && <p className="mt-8 text-sm text-muted-foreground">No transcript yet.</p>}
 
       {lines && lines.length > 0 && (
-        <div className="mt-4 grid gap-6 lg:grid-cols-[1fr_15rem]">
-          <Transcript
-            lines={lines}
-            speakers={speakers}
-            meName={meName}
-            player={tracks.length ? player : null}
-            onChanged={loadTranscript}
-            onError={onError}
-          />
-          <aside className="order-first lg:order-last">
-            <div className="lg:sticky lg:top-36">
-              <SpeakersPanel speakers={speakers} meName={meName} onChanged={loadTranscript} onError={onError} />
+        <Tabs value={summariesOn ? tab : "transcript"} onValueChange={setTab} className="mt-4">
+          {summariesOn && (
+            <TabsList>
+              <TabsTrigger value="transcript">Transcript</TabsTrigger>
+              <TabsTrigger value="summary">Summary</TabsTrigger>
+            </TabsList>
+          )}
+          <TabsContent value="transcript" className="pt-2">
+            <div className="grid gap-6 lg:grid-cols-[1fr_15rem]">
+              <Transcript
+                lines={lines}
+                speakers={speakers}
+                meName={meName}
+                player={tracks.length ? player : null}
+                onChanged={loadTranscript}
+                onError={onError}
+              />
+              <aside className="order-first lg:order-last">
+                <div className="lg:sticky lg:top-36">
+                  <SpeakersPanel speakers={speakers} meName={meName} onChanged={loadTranscript} onError={onError} />
+                </div>
+              </aside>
             </div>
-          </aside>
-        </div>
+          </TabsContent>
+          {summariesOn && (
+            <TabsContent value="summary" className="max-w-3xl pt-2">
+              <SummaryPanel id={id} hasTranscript={!!lines.length} onOpenSettings={() => onOpenSettings("summary")} />
+            </TabsContent>
+          )}
+        </Tabs>
       )}
 
       {editing && meeting && (

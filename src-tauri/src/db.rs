@@ -14,6 +14,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/0003_source_spec.sql")),
         M::up(include_str!("../migrations/0004_jobs.sql")),
         M::up(include_str!("../migrations/0005_voice_profiles.sql")),
+        M::up(include_str!("../migrations/0006_summaries.sql")),
     ])
 });
 
@@ -233,9 +234,11 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         MIGRATIONS.to_latest(&mut conn)?;
-        Ok(Self {
+        let db = Self {
             conn: Mutex::new(conn),
-        })
+        };
+        db.ensure_builtin_templates()?;
+        Ok(db)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -332,7 +335,8 @@ impl Db {
     ) -> Result<(), DbError> {
         let tags = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         self.conn().execute(
-            "UPDATE meetings SET title = ?2, remote_speaker_count_hint = ?3, tags = ?4, updated_at = ?5
+            "UPDATE meetings SET title_generated = (title_generated AND title = ?2), title = ?2,
+                 remote_speaker_count_hint = ?3, tags = ?4, updated_at = ?5
              WHERE id = ?1",
             params![id, title, speaker_hint, tags, now_ms()],
         )?;
@@ -410,14 +414,14 @@ impl Db {
             .optional()?)
     }
 
-    /// Latest job of each meeting (for status display).
-    pub fn latest_jobs(&self) -> Result<Vec<JobRow>, DbError> {
+    /// Latest job of a kind for each meeting (for status display).
+    pub fn latest_jobs(&self, kind: &str) -> Result<Vec<JobRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT id, meeting_id, kind, stage, progress, status, error, options FROM jobs j
-             WHERE id = (SELECT max(id) FROM jobs WHERE meeting_id = j.meeting_id)",
+             WHERE id = (SELECT max(id) FROM jobs WHERE meeting_id = j.meeting_id AND kind = ?1)",
         )?;
-        let rows = stmt.query_map([], Self::job_from_row)?;
+        let rows = stmt.query_map([kind], Self::job_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -437,10 +441,11 @@ impl Db {
     }
 
     /// Cancels a meeting's queued (not yet running) jobs. Returns how many.
-    pub fn cancel_queued_jobs(&self, meeting_id: i64) -> Result<usize, DbError> {
+    pub fn cancel_queued_jobs(&self, meeting_id: i64, kind: &str) -> Result<usize, DbError> {
         Ok(self.conn().execute(
-            "UPDATE jobs SET status = 'cancelled', updated_at = ?2 WHERE meeting_id = ?1 AND status = 'queued'",
-            params![meeting_id, now_ms()],
+            "UPDATE jobs SET status = 'cancelled', updated_at = ?2
+             WHERE meeting_id = ?1 AND kind = ?3 AND status = 'queued'",
+            params![meeting_id, now_ms(), kind],
         )?)
     }
 
@@ -1089,6 +1094,327 @@ impl Db {
     }
 }
 
+/// A summary template: what to focus on and which sections to write.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateRow {
+    pub id: i64,
+    pub name: String,
+    pub instructions: String,
+    pub sections: Vec<String>,
+    pub builtin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryRow {
+    pub markdown: String,
+    pub template_id: Option<i64>,
+    pub template_name: String,
+    pub model_id: String,
+    pub created_at: i64,
+    pub edited: bool,
+}
+
+/// Built-in templates: (key, name, instructions, sections).
+pub const BUILTIN_TEMPLATES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "general",
+        "General meeting",
+        "Capture what was discussed and agreed, and who will do what next.",
+        &["Summary", "Decisions", "Action items", "Open questions"],
+    ),
+    (
+        "client",
+        "Client call",
+        "Focus on the client's needs, concerns and requests, what was promised to them, and the \
+         next steps on each side.",
+        &[
+            "Summary",
+            "Client needs",
+            "Commitments",
+            "Next steps",
+            "Open questions",
+        ],
+    ),
+    (
+        "interview",
+        "Interview",
+        "Summarize the candidate's background, the main points of their answers, strengths and \
+         concerns raised, and any follow-ups. Stay neutral; don't make a hiring recommendation.",
+        &[
+            "Summary",
+            "Background",
+            "Key answers",
+            "Strengths",
+            "Concerns",
+            "Follow-ups",
+        ],
+    ),
+    (
+        "one_on_one",
+        "1:1",
+        "Capture updates, wins, blockers, feedback given in either direction, and agreed next \
+         steps.",
+        &["Updates", "Blockers", "Feedback", "Action items"],
+    ),
+    (
+        "brainstorm",
+        "Brainstorm",
+        "List the ideas raised, grouped by theme, which ones got the most support, and what will \
+         be explored next.",
+        &["Summary", "Ideas", "Favourites", "Next steps"],
+    ),
+];
+
+/// Keep in step with the error message in `clean_template`.
+const MAX_SECTIONS: usize = 12;
+
+fn clean_template(
+    name: &str,
+    instructions: &str,
+    sections: &[String],
+) -> Result<(String, String, String), DbError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 60 {
+        return Err(DbError::Invalid(
+            "a template needs a name of up to 60 characters",
+        ));
+    }
+    let instructions = instructions.trim();
+    if instructions.chars().count() > 2000 {
+        return Err(DbError::Invalid(
+            "keep the instructions under 2,000 characters",
+        ));
+    }
+    let sections: Vec<&str> = sections
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sections.len() > MAX_SECTIONS || sections.iter().any(|s| s.chars().count() > 60) {
+        return Err(DbError::Invalid(
+            "use up to 12 sections of up to 60 characters each",
+        ));
+    }
+    Ok((
+        name.to_owned(),
+        instructions.to_owned(),
+        serde_json::to_string(&sections).expect("serializes"),
+    ))
+}
+
+impl Db {
+    /// Adds any built-in template that isn't there yet (first run, or a new one in an update).
+    pub fn ensure_builtin_templates(&self) -> Result<(), DbError> {
+        let c = self.conn();
+        for (i, (key, name, instructions, sections)) in BUILTIN_TEMPLATES.iter().enumerate() {
+            c.execute(
+                "INSERT OR IGNORE INTO templates
+                     (name, system_prompt, sections_json, is_builtin, builtin_key, position)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![
+                    name,
+                    instructions,
+                    serde_json::to_string(sections).expect("serializes"),
+                    key,
+                    i as i64
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn template_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TemplateRow> {
+        let sections: String = r.get(3)?;
+        Ok(TemplateRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            instructions: r.get(2)?,
+            sections: serde_json::from_str(&sections).unwrap_or_default(),
+            builtin: r.get(4)?,
+        })
+    }
+
+    pub fn templates(&self) -> Result<Vec<TemplateRow>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT id, name, system_prompt, sections_json, is_builtin FROM templates
+             ORDER BY is_builtin DESC, position, id",
+        )?;
+        let rows = stmt.query_map([], Self::template_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn template(&self, id: i64) -> Result<Option<TemplateRow>, DbError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, name, system_prompt, sections_json, is_builtin FROM templates
+                 WHERE id = ?1",
+                [id],
+                Self::template_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Creates a template (`id` = `None`) or updates one; returns its id.
+    pub fn save_template(
+        &self,
+        id: Option<i64>,
+        name: &str,
+        instructions: &str,
+        sections: &[String],
+    ) -> Result<i64, DbError> {
+        let (name, instructions, sections) = clean_template(name, instructions, sections)?;
+        let c = self.conn();
+        match id {
+            Some(id) => {
+                let n = c.execute(
+                    "UPDATE templates SET name = ?2, system_prompt = ?3, sections_json = ?4
+                     WHERE id = ?1",
+                    params![id, name, instructions, sections],
+                )?;
+                if n == 0 {
+                    return Err(DbError::Invalid("that template no longer exists"));
+                }
+                Ok(id)
+            }
+            None => {
+                c.execute(
+                    "INSERT INTO templates (name, system_prompt, sections_json, is_builtin, position)
+                     VALUES (?1, ?2, ?3, 0, (SELECT coalesce(max(position), 0) + 1 FROM templates))",
+                    params![name, instructions, sections],
+                )?;
+                Ok(c.last_insert_rowid())
+            }
+        }
+    }
+
+    /// Deletes a template of the user's own (built-in ones can only be reset).
+    pub fn delete_template(&self, id: i64) -> Result<(), DbError> {
+        let n = self.conn().execute(
+            "DELETE FROM templates WHERE id = ?1 AND is_builtin = 0",
+            [id],
+        )?;
+        if n == 0 {
+            return Err(DbError::Invalid("built-in templates can't be deleted"));
+        }
+        Ok(())
+    }
+
+    /// Restores a built-in template's original wording.
+    pub fn reset_template(&self, id: i64) -> Result<(), DbError> {
+        let c = self.conn();
+        let key: Option<String> = c
+            .query_row(
+                "SELECT builtin_key FROM templates WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some((_, name, instructions, sections)) = key
+            .as_deref()
+            .and_then(|k| BUILTIN_TEMPLATES.iter().find(|t| t.0 == k))
+        else {
+            return Err(DbError::Invalid("only built-in templates can be reset"));
+        };
+        c.execute(
+            "UPDATE templates SET name = ?2, system_prompt = ?3, sections_json = ?4 WHERE id = ?1",
+            params![
+                id,
+                name,
+                instructions,
+                serde_json::to_string(sections).expect("serializes")
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn summary(&self, meeting_id: i64) -> Result<Option<SummaryRow>, DbError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT markdown, template_id, template_name, model_id, created_at, edited
+                 FROM summaries WHERE meeting_id = ?1",
+                [meeting_id],
+                |r| {
+                    Ok(SummaryRow {
+                        markdown: r.get(0)?,
+                        template_id: r.get(1)?,
+                        template_name: r.get(2)?,
+                        model_id: r.get(3)?,
+                        created_at: r.get(4)?,
+                        edited: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Stores a freshly written summary, replacing the meeting's previous one.
+    pub fn save_summary(
+        &self,
+        meeting_id: i64,
+        template: &TemplateRow,
+        model_id: &str,
+        markdown: &str,
+    ) -> Result<(), DbError> {
+        let now = now_ms();
+        self.conn().execute(
+            "INSERT INTO summaries (meeting_id, template_id, template_name, model_id, markdown,
+                                    created_at, updated_at, edited)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0)
+             ON CONFLICT (meeting_id) DO UPDATE SET template_id = ?2, template_name = ?3,
+                 model_id = ?4, markdown = ?5, created_at = ?6, updated_at = ?6, edited = 0",
+            params![
+                meeting_id,
+                template.id,
+                template.name,
+                model_id,
+                markdown,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The user's own edit of a summary.
+    pub fn edit_summary(&self, meeting_id: i64, markdown: &str) -> Result<(), DbError> {
+        let n = self.conn().execute(
+            "UPDATE summaries SET markdown = ?2, edited = 1, updated_at = ?3 WHERE meeting_id = ?1",
+            params![meeting_id, markdown, now_ms()],
+        )?;
+        if n == 0 {
+            return Err(DbError::Invalid("this meeting has no summary"));
+        }
+        Ok(())
+    }
+
+    /// Whether the meeting has no title of the user's own (empty, or one written by the model).
+    pub fn title_is_open(&self, meeting_id: i64) -> Result<bool, DbError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT trim(title) = '' OR title_generated FROM meetings WHERE id = ?1",
+                [meeting_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Sets a model-written title, unless the user has given the meeting one meanwhile.
+    pub fn set_generated_title(&self, meeting_id: i64, title: &str) -> Result<bool, DbError> {
+        Ok(self.conn().execute(
+            "UPDATE meetings SET title = ?2, title_generated = 1, updated_at = ?3
+             WHERE id = ?1 AND (trim(title) = '' OR title_generated)",
+            params![meeting_id, title, now_ms()],
+        )? > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1492,9 +1818,93 @@ mod tests {
     }
 
     #[test]
+    fn templates_are_seeded_edited_and_reset() {
+        let db = Db::open_in_memory().unwrap();
+        // Seeding again (every launch) adds nothing.
+        db.ensure_builtin_templates().unwrap();
+        let all = db.templates().unwrap();
+        assert_eq!(all.len(), BUILTIN_TEMPLATES.len());
+        assert_eq!(all[0].name, "General meeting");
+        assert!(all.iter().all(|t| t.builtin));
+
+        let general = all[0].id;
+        db.save_template(
+            Some(general),
+            " Standup ",
+            "Short.",
+            &["Done".into(), " ".into()],
+        )
+        .unwrap();
+        let t = db.template(general).unwrap().unwrap();
+        assert_eq!(
+            (t.name.as_str(), t.sections.as_slice()),
+            ("Standup", &["Done".to_owned()][..])
+        );
+        assert!(
+            db.delete_template(general).is_err(),
+            "built-ins can't be deleted"
+        );
+        db.reset_template(general).unwrap();
+        assert_eq!(
+            db.template(general).unwrap().unwrap().name,
+            "General meeting"
+        );
+
+        let mine = db
+            .save_template(None, "Retro", "What went well.", &[])
+            .unwrap();
+        assert!(!db.template(mine).unwrap().unwrap().builtin);
+        assert_eq!(db.templates().unwrap().last().unwrap().id, mine);
+        assert!(db.reset_template(mine).is_err());
+        assert!(db.save_template(None, "  ", "", &[]).is_err());
+        db.delete_template(mine).unwrap();
+        assert!(db.template(mine).unwrap().is_none());
+    }
+
+    #[test]
+    fn summaries_replace_and_titles_respect_the_user() {
+        let db = Db::open_in_memory().unwrap();
+        let m = db.create_meeting(1_000, "").unwrap();
+        let t = db.templates().unwrap().remove(0);
+        assert!(db.summary(m).unwrap().is_none());
+        assert!(db.edit_summary(m, "x").is_err());
+        db.save_summary(m, &t, "qwen3.5-4b", "## Summary\nOne.")
+            .unwrap();
+        db.edit_summary(m, "## Summary\nEdited.").unwrap();
+        assert!(db.summary(m).unwrap().unwrap().edited);
+        db.save_summary(m, &t, "qwen3.5-9b", "## Summary\nTwo.")
+            .unwrap();
+        let s = db.summary(m).unwrap().unwrap();
+        assert_eq!(
+            (s.markdown.as_str(), s.model_id.as_str(), s.edited),
+            ("## Summary\nTwo.", "qwen3.5-9b", false)
+        );
+        assert_eq!(s.template_name, "General meeting");
+
+        // Untitled -> generated title, which a later one may replace.
+        assert!(db.title_is_open(m).unwrap());
+        assert!(db.set_generated_title(m, "Budget review").unwrap());
+        assert!(db.title_is_open(m).unwrap());
+        assert!(db.set_generated_title(m, "Q3 budget review").unwrap());
+        // Keeping the generated title while editing other details keeps it replaceable...
+        db.update_meeting_details(m, "Q3 budget review", None, &[])
+            .unwrap();
+        assert!(db.title_is_open(m).unwrap());
+        // ...but a title the user typed is theirs.
+        db.update_meeting_details(m, "Budget", None, &[]).unwrap();
+        assert!(!db.title_is_open(m).unwrap());
+        assert!(!db.set_generated_title(m, "Other").unwrap());
+        assert_eq!(db.meeting(m).unwrap().unwrap().title, "Budget");
+
+        // Deleting the meeting deletes its summary.
+        db.delete_meeting(m).unwrap();
+        assert!(db.summary(m).unwrap().is_none());
+    }
+
+    #[test]
     fn migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 5);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]

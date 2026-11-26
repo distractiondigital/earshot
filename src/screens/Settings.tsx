@@ -12,6 +12,7 @@ import { useTheme } from "@/lib/theme";
 import { useUpdates } from "@/lib/updates";
 import { RecordingSettings } from "@/screens/RecordingSettings";
 import { SpeakersSettings } from "@/screens/SpeakersSettings";
+import { SummarySettings } from "@/screens/SummarySettings";
 import { TranscriptionSettings } from "@/screens/TranscriptionSettings";
 
 export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => void }) {
@@ -24,6 +25,7 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
           <TabsTrigger value="recording">Recording</TabsTrigger>
           <TabsTrigger value="transcription">Transcription</TabsTrigger>
           <TabsTrigger value="speakers">Speakers</TabsTrigger>
+          <TabsTrigger value="summary">Summary</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
         <TabsContent value="general" className="pt-4">
@@ -37,6 +39,9 @@ export function Settings({ tab, onTab }: { tab: string; onTab: (t: string) => vo
         </TabsContent>
         <TabsContent value="speakers" className="pt-4">
           <SpeakersSettings />
+        </TabsContent>
+        <TabsContent value="summary" className="pt-4">
+          <SummarySettings />
         </TabsContent>
         <TabsContent value="about" className="pt-4">
           <About />

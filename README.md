@@ -5,7 +5,7 @@ the meeting audio as separate tracks, transcribes them with Whisper, labels spea
 open-source diarization, and can summarize with a local model. Nothing leaves the machine.
 
 > Status: early development. Recording, transcription, speaker labels, the meeting player, speaker
-> editing, search, exports and voice profiles work; summaries are next.
+> editing, search, exports, voice profiles and local summaries work; polish and packaging are next.
 
 ## Development
 
@@ -13,10 +13,10 @@ Requirements:
 
 - Node.js 24+
 - Rust (the toolchain pinned in `rust-toolchain.toml` is installed automatically by rustup)
-- CMake and LLVM/libclang (to build whisper.cpp for the transcription worker)
+- CMake and LLVM/libclang (to build whisper.cpp and llama.cpp for the sidecars)
 - Windows: Visual Studio Build Tools with the C++ workload, WebView2 (preinstalled on Windows 11)
 - macOS: Xcode Command Line Tools
-- Optional: NVIDIA CUDA Toolkit for GPU transcription on Windows (detected automatically;
+- Optional: NVIDIA CUDA Toolkit for GPU transcription and summaries on Windows (detected automatically;
   `node scripts/build-worker.mjs --cpu` forces a CPU build)
 
 On Windows, double-click `dev.cmd` (or run `npm run tauri:dev`) to start "Earshot Dev" with hot
@@ -30,7 +30,7 @@ worker.
 ```sh
 npm ci
 npm run tauri:dev      # run "Earshot Dev" with hot reload (separate data folder, no updater)
-npm run build:worker   # build the worker sidecar (tauri:dev does this too)
+npm run build:worker   # build both sidecars (tauri:dev does this too)
 cargo test --workspace # Rust tests
 ```
 
@@ -54,7 +54,9 @@ Building installers locally (`npm run tauri build`) requires the updater signing
 | `src/` | React + TypeScript frontend |
 | `src-tauri/` | Tauri app (Rust core: storage, tray, recorder, job supervisor) |
 | `src-tauri/migrations/` | SQLite schema migrations |
-| `crates/earshot-worker/` | Inference sidecar (all ML runs in this separate process) |
+| `crates/earshot-worker/` | Transcription and speaker sidecar (ML runs in separate processes) |
+| `crates/earshot-llm/` | Summary sidecar (llama.cpp; separate because it bundles its own ggml) |
+| `crates/earshot-protocol/` | JSON protocol between the app and the sidecars |
 | `scripts/` | Build helpers |
 
 ## License

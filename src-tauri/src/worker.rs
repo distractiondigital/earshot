@@ -1,5 +1,6 @@
-//! Locating and pinging the `earshot-worker` sidecar (all ML inference runs there, never in this
-//! process). Job execution lives in `processing.rs`.
+//! Locating and pinging the sidecars: `earshot-worker` (transcription, speakers) and `earshot-llm`
+//! (summaries). All ML inference runs there, never in this process. Job execution lives in
+//! `processing.rs` and `summary.rs`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -13,15 +14,23 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tauri places `externalBin` sidecars next to the main executable (without the target-triple
 /// suffix). In development, Cargo builds the worker into the same `target/<profile>` directory.
-pub fn worker_path() -> Option<PathBuf> {
+pub fn sidecar_path(name: &str) -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let path = dir.join(format!("earshot-worker{}", std::env::consts::EXE_SUFFIX));
+    let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     path.is_file().then_some(path)
 }
 
-/// A worker command with no console window on Windows.
+pub const WORKER: &str = "earshot-worker";
+pub const LLM: &str = "earshot-llm";
+
+/// The transcription worker, with no console window on Windows.
 pub fn command() -> Result<Command, String> {
-    let path = worker_path().ok_or("earshot-worker binary not found")?;
+    command_for(WORKER)
+}
+
+/// A sidecar command with no console window on Windows.
+pub fn command_for(name: &str) -> Result<Command, String> {
+    let path = sidecar_path(name).ok_or_else(|| format!("{name} binary not found"))?;
     #[allow(unused_mut)]
     let mut cmd = Command::new(path);
     #[cfg(windows)]

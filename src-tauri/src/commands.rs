@@ -45,6 +45,12 @@ const SETTINGS: &[(&str, Option<&[&str]>)] = &[
     ("speakers.autoMatch", Some(&["true", "false"])),
     // Similarity needed to recognise a voice (0.3–0.95); validated in check_setting.
     ("speakers.matchThreshold", None),
+    // Summaries: never, on demand, or automatically after processing.
+    ("summary.mode", Some(&["never", "manual", "auto"])),
+    // Title untitled meetings with the summary model.
+    ("summary.autoTitle", Some(&["true", "false"])),
+    // Default template id; validated in check_setting.
+    ("summary.template", None),
 ];
 /// Readable but only changed through dedicated commands.
 const READ_ONLY_SETTINGS: &[&str] = &[
@@ -52,6 +58,7 @@ const READ_ONLY_SETTINGS: &[&str] = &[
     "recording.hotkey",
     "transcription.model",
     "speakers.embeddingModel",
+    "summary.model",
 ];
 
 pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String> {
@@ -80,6 +87,12 @@ pub(crate) fn check_setting(key: &str, value: Option<&str>) -> Result<(), String
         && !v.parse::<f32>().is_ok_and(|n| (0.3..=0.95).contains(&n))
     {
         return Err(format!("match threshold must be 0.3–0.95: {v}"));
+    }
+    if key == "summary.template"
+        && let Some(v) = value
+        && v.parse::<i64>().is_err()
+    {
+        return Err(format!("invalid template: {v}"));
     }
     if key == "speakers.meName"
         && let Some(v) = value
@@ -256,6 +269,7 @@ pub async fn recover_meeting(app: AppHandle, id: i64) -> Result<i64, String> {
 pub struct ModelsInfo {
     hardware: models::hardware::Hardware,
     recommended: &'static str,
+    recommended_summary: &'static str,
     models: Vec<models::ModelView>,
 }
 
@@ -269,10 +283,12 @@ pub async fn list_models(app: AppHandle) -> Result<ModelsInfo, String> {
     blocking(move || {
         let hw = hardware().clone();
         let recommended = models::hardware::recommend(&hw);
+        let recommended_summary = models::hardware::recommend_summary(&hw);
         Ok(ModelsInfo {
-            models: models::list(&app, recommended),
+            models: models::list(&app, &[recommended, recommended_summary]),
             hardware: hw,
             recommended,
+            recommended_summary,
         })
     })
     .await
@@ -378,7 +394,116 @@ pub fn cancel_processing(app: AppHandle, id: i64) {
 
 #[tauri::command]
 pub fn processing_jobs(db: State<'_, Db>) -> Result<Vec<crate::db::JobRow>, String> {
-    db.latest_jobs().map_err(err)
+    db.latest_jobs(crate::processing::JOB_KIND).map_err(err)
+}
+
+// ---- Summaries ----
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryState {
+    summary: Option<crate::db::SummaryRow>,
+    /// The meeting's latest summary job (running, failed, …).
+    job: Option<crate::db::JobRow>,
+}
+
+#[tauri::command]
+pub fn get_summary(db: State<'_, Db>, id: i64) -> Result<SummaryState, String> {
+    let job = db
+        .latest_jobs(crate::summary::JOB_KIND)
+        .map_err(err)?
+        .into_iter()
+        .find(|j| j.meeting_id == id);
+    Ok(SummaryState {
+        summary: db.summary(id).map_err(err)?,
+        job,
+    })
+}
+
+/// Latest summary job of each meeting (for "Summarizing…" in the list).
+#[tauri::command]
+pub fn summary_jobs(db: State<'_, Db>) -> Result<Vec<crate::db::JobRow>, String> {
+    db.latest_jobs(crate::summary::JOB_KIND).map_err(err)
+}
+
+/// Writes (or rewrites) a meeting's summary, titling the meeting too if it has no title yet.
+#[tauri::command]
+pub fn summarize_meeting(
+    app: AppHandle,
+    id: i64,
+    template_id: Option<i64>,
+    model: Option<String>,
+) -> Result<(), String> {
+    let db = app.state::<Db>();
+    if let Some(m) = &model
+        && !models::find(m).is_some_and(|m| m.category == "summary" && models::is_ready(&app, m))
+    {
+        return Err("That summary model isn't downloaded.".into());
+    }
+    if model.is_none() && models::summary_model(&app).is_none() {
+        return Err("Choose and download a summary model in Settings → Summary.".into());
+    }
+    let title = db
+        .get_setting(crate::summary::AUTO_TITLE_SETTING)
+        .map_err(err)?
+        .as_deref()
+        != Some("false");
+    crate::summary::enqueue(
+        &app,
+        id,
+        &crate::summary::SummaryOptions {
+            summary: true,
+            title,
+            template_id,
+            model,
+            backend: None,
+        },
+    )
+}
+
+#[tauri::command]
+pub fn cancel_summary(app: AppHandle, id: i64) {
+    app.state::<crate::processing::Processor>()
+        .cancel_kind(&app, id, crate::summary::JOB_KIND);
+    let _ = app.emit(crate::summary::EVENT_CHANGED, id);
+}
+
+#[tauri::command]
+pub fn edit_summary(app: AppHandle, id: i64, markdown: String) -> Result<(), String> {
+    if markdown.len() > 200_000 {
+        return Err("That summary is too long.".into());
+    }
+    app.state::<Db>().edit_summary(id, &markdown).map_err(err)?;
+    let _ = app.emit(crate::summary::EVENT_CHANGED, id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_templates(db: State<'_, Db>) -> Result<Vec<crate::db::TemplateRow>, String> {
+    db.templates().map_err(err)
+}
+
+/// Creates (no `id`) or updates a template; returns its id.
+#[tauri::command]
+pub fn save_template(
+    db: State<'_, Db>,
+    id: Option<i64>,
+    name: String,
+    instructions: String,
+    sections: Vec<String>,
+) -> Result<i64, String> {
+    db.save_template(id, &name, &instructions, &sections)
+        .map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_template(db: State<'_, Db>, id: i64) -> Result<(), String> {
+    db.delete_template(id).map_err(err)
+}
+
+#[tauri::command]
+pub fn reset_template(db: State<'_, Db>, id: i64) -> Result<(), String> {
+    db.reset_template(id).map_err(err)
 }
 
 // ---- Speakers and transcript editing ----
@@ -512,12 +637,14 @@ pub async fn export_meeting(
         let db = app.state::<Db>();
         let meeting = db.meeting(id).map_err(err)?.ok_or("meeting not found")?;
         let lines = db.transcript(id).map_err(err)?;
+        let summary = db.summary(id).map_err(err)?;
         let me = me_name(&db);
         let doc = crate::export::Doc {
             meeting: &meeting,
             lines: &lines,
             me_name: &me,
             when: when.chars().take(100).collect(),
+            summary: summary.as_ref().map(|s| s.markdown.as_str()),
         };
         let content = crate::export::render(&doc, format);
         let date: String = date

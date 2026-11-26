@@ -18,6 +18,8 @@ export function RecordingSettings() {
   const [sources, setSources] = useState<Sources | null>(null);
   const [showPill, setShowPill] = useState(true);
   const [consent, setConsent] = useState(false);
+  const [autoProcess, setAutoProcess] = useState(true);
+  const [summaryMode, setSummaryMode] = useState("auto");
   const [dir, setDir] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -33,6 +35,8 @@ export function RecordingSettings() {
     ipc.getSetting("recording.systemSource").then((v) => setSystem(parseSavedSource(v)));
     ipc.getSetting("recording.showPill").then((v) => setShowPill(v !== "false"));
     ipc.getSetting("recording.consentReminder").then((v) => setConsent(v === "true"));
+    ipc.getSetting("transcription.autoProcess").then((v) => setAutoProcess(v !== "false"));
+    ipc.getSetting("summary.mode").then((v) => v && setSummaryMode(v));
     recorder.recordingsDir().then(setDir);
   }, []);
 
@@ -78,6 +82,24 @@ export function RecordingSettings() {
             setSystem(s);
             save("recording.systemSource", serializeSource(s));
           }}
+        />
+      </SettingsRow>
+
+      <SettingsRow
+        label="Process recordings automatically"
+        hint={
+          summaryMode === "auto"
+            ? "Transcribes, labels speakers and summarizes as soon as a recording stops."
+            : "Transcribes and labels speakers as soon as a recording stops. Summaries are set to on demand in Summary settings."
+        }
+      >
+        <Switch
+          checked={autoProcess}
+          onCheckedChange={(v) => {
+            setAutoProcess(v);
+            save("transcription.autoProcess", String(v));
+          }}
+          aria-label="Process recordings automatically"
         />
       </SettingsRow>
 

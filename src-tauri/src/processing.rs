@@ -25,7 +25,7 @@ use crate::{models, speakers};
 pub const EVENT_PROGRESS: &str = "processing://progress";
 pub const EVENT_CHANGED: &str = "processing://changed";
 
-const JOB_KIND: &str = "transcribe";
+pub const JOB_KIND: &str = "transcribe";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,11 +61,12 @@ struct Progress {
 }
 
 /// The job currently running (so it can be cancelled).
-struct Current {
-    meeting_id: i64,
-    stdin: Option<ChildStdin>,
-    child: Option<Child>,
-    cancelled: bool,
+pub(crate) struct Current {
+    pub meeting_id: i64,
+    pub kind: &'static str,
+    pub stdin: Option<ChildStdin>,
+    pub child: Option<Child>,
+    pub cancelled: bool,
 }
 
 /// Managed state: wakes the processing thread and tracks the running job.
@@ -99,10 +100,18 @@ impl Processor {
 
     /// Cancels a meeting's queued or running transcription.
     pub fn cancel(&self, app: &AppHandle, meeting_id: i64) {
+        self.cancel_kind(app, meeting_id, JOB_KIND);
+    }
+
+    /// Cancels a meeting's queued or running job of one kind.
+    pub fn cancel_kind(&self, app: &AppHandle, meeting_id: i64, kind: &str) {
         let db = app.state::<Db>();
-        let _ = db.cancel_queued_jobs(meeting_id);
+        let _ = db.cancel_queued_jobs(meeting_id, kind);
         let mut cur = self.current.lock().unwrap();
-        if let Some(c) = cur.as_mut().filter(|c| c.meeting_id == meeting_id) {
+        if let Some(c) = cur
+            .as_mut()
+            .filter(|c| c.meeting_id == meeting_id && c.kind == kind)
+        {
             c.cancelled = true;
             // Ask nicely, then make sure: the worker exits on stdin EOF anyway.
             if let Some(stdin) = c.stdin.as_mut() {
@@ -162,6 +171,18 @@ fn run_loop(app: AppHandle, wake: Receiver<()>, current: Arc<Mutex<Option<Curren
                 continue;
             }
         };
+        if job.kind == crate::summary::JOB_KIND {
+            let options = job
+                .options
+                .as_deref()
+                .and_then(|o| serde_json::from_str(o).ok())
+                .unwrap_or_default();
+            crate::summary::run_job(&app, job.id, job.meeting_id, &options, &current);
+            *current.lock().unwrap() = None;
+            let _ = app.emit(crate::summary::EVENT_CHANGED, job.meeting_id);
+            let _ = app.emit(EVENT_CHANGED, job.meeting_id);
+            continue;
+        }
         let options: JobOptions = job
             .options
             .as_deref()
@@ -280,6 +301,7 @@ fn run_job(
 
     *current.lock().unwrap() = Some(Current {
         meeting_id,
+        kind: JOB_KIND,
         stdin: None,
         child: None,
         cancelled: false,
@@ -528,6 +550,7 @@ fn run_job(
         "meeting {meeting_id} processed in {:.1} s",
         started.elapsed().as_secs_f64()
     );
+    crate::summary::after_processing(app, meeting_id, options.speakers_only);
 }
 
 /// Default for Settings → Speakers → sensitivity (0–100).
@@ -780,6 +803,8 @@ fn run_worker(
                     Stage::LoadModel => (10.0, 5.0),
                     Stage::Transcribe => (15.0, 85.0),
                     Stage::Diarize => (5.0, 95.0),
+                    // Summary stages never come from this worker.
+                    Stage::Notes | Stage::Summarize | Stage::Title => (0.0, 100.0),
                 };
                 let step_pct = base + span * (pct / 100.0);
                 let overall = (step.index as f32 * 100.0 + step_pct) / step.count as f32;
@@ -829,7 +854,7 @@ fn run_worker(
                 });
                 break;
             }
-            Event::Pong { .. } => {}
+            Event::Pong { .. } | Event::Token { .. } | Event::Summary { .. } => {}
         }
     }
 

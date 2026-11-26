@@ -11,6 +11,7 @@ import { SearchResults } from "@/components/SearchResults";
 import { parseSavedSource, SourceSelect } from "@/components/SourceSelect";
 import { processing, useModels, useProcessing, type Job } from "@/lib/models";
 import { ipc } from "@/lib/ipc";
+import { summaries } from "@/lib/summary";
 import {
   formatDuration,
   formatElapsed,
@@ -40,6 +41,8 @@ export function Meetings({
   const [error, setError] = useState<string | null>(null);
   const [detailsFor, setDetailsFor] = useState<number | null>(null);
   const [interrupted, setInterrupted] = useState<Interrupted | null>(null);
+  // Meetings whose summary is being written (or waiting to be).
+  const [summarizing, setSummarizing] = useState<Set<number>>(new Set());
 
   const refresh = useCallback(() => {
     recorder.meetings().then(setMeetings).catch((e) => setError(String(e)));
@@ -54,9 +57,19 @@ export function Meetings({
     });
     const unState = listen("recorder://state", refresh);
     const unProc = listen("processing://changed", refresh);
+    const loadSummaries = () =>
+      summaries
+        .jobs()
+        .then((js) => setSummarizing(new Set(js.filter((j) => j.status === "running" || j.status === "queued").map((j) => j.meetingId))))
+        .catch(() => {});
+    loadSummaries();
+    const unSummary = listen("summary://changed", () => {
+      loadSummaries();
+      refresh();
+    });
     const unError = listen<string>("recorder://error", (e) => setError(e.payload));
     return () => {
-      for (const u of [unStopped, unState, unError, unProc]) u.then((f) => f());
+      for (const u of [unStopped, unState, unError, unProc, unSummary]) u.then((f) => f());
     };
   }, [refresh]);
 
@@ -124,6 +137,7 @@ export function Meetings({
                 meeting={m}
                 job={jobs[m.id]}
                 livePct={live?.meetingId === m.id ? live.pct : null}
+                summarizing={summarizing.has(m.id)}
                 onChanged={() => {
                   refresh();
                   refreshJobs();
@@ -328,6 +342,7 @@ function MeetingRow({
   meeting: m,
   job,
   livePct,
+  summarizing,
   onChanged,
   onOpen,
   onError,
@@ -335,6 +350,7 @@ function MeetingRow({
   meeting: Meeting;
   job: Job | undefined;
   livePct: number | null;
+  summarizing: boolean;
   onChanged: () => void;
   onOpen: () => void;
   onError: (e: string) => void;
@@ -411,6 +427,10 @@ function MeetingRow({
         <Button size="sm" variant="outline" onClick={() => act(() => processing.transcribe(m.id))} disabled={busy}>
           Transcribe
         </Button>
+      ) : summarizing && m.status === "ready" ? (
+        <span className="text-xs text-muted-foreground" role="status">
+          Summarizing…
+        </span>
       ) : (
         <Badge variant="secondary">{STATUS[m.status]}</Badge>
       )}

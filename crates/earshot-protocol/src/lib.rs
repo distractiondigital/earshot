@@ -1,5 +1,6 @@
-//! IPC between the Earshot app and `earshot-worker`: newline-delimited JSON over the worker's
-//! stdin (requests) and stdout (events). One job runs at a time; the worker exits on stdin EOF.
+//! IPC between the Earshot app and its sidecars (`earshot-worker` for transcription and speakers,
+//! `earshot-llm` for summaries): newline-delimited JSON over the sidecar's stdin (requests) and
+//! stdout (events). One job runs at a time; a sidecar exits on stdin EOF.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,11 @@ pub enum Request {
     Diarize {
         id: u64,
         job: DiarizeJob,
+    },
+    /// Summarizes and/or titles a transcript (`earshot-llm` only).
+    Summarize {
+        id: u64,
+        job: SummarizeJob,
     },
     /// Cancels the running job with this id (it ends with an `Error { code: Cancelled }`).
     Cancel {
@@ -64,7 +70,31 @@ pub struct DiarizeJob {
     pub threshold: f32,
 }
 
-/// Worker -> app.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummarizeJob {
+    /// llama.cpp GGUF model.
+    pub model_path: String,
+    pub backend: Backend,
+    /// Context window to allocate, in tokens (capped at what the model was trained for).
+    pub context_tokens: u32,
+    /// One line per utterance: `[mm:ss] Name: text`.
+    pub transcript: String,
+    /// How to summarize; `None` only writes a title.
+    pub template: Option<SummaryTemplate>,
+    /// Also write a short title for the meeting.
+    pub title: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummaryTemplate {
+    pub name: String,
+    /// What to focus on, in the user's words.
+    pub instructions: String,
+    /// Section headings, in order.
+    pub sections: Vec<String>,
+}
+
+/// Sidecar -> app.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -89,6 +119,16 @@ pub enum Event {
         id: u64,
         diarization: Diarization,
     },
+    /// The next piece of the summary as it's written (`earshot-llm`).
+    Token {
+        id: u64,
+        text: String,
+    },
+    /// Result of a `Summarize` request.
+    Summary {
+        id: u64,
+        summary: Summary,
+    },
     Error {
         id: u64,
         code: ErrorCode,
@@ -108,6 +148,12 @@ pub enum Stage {
     Transcribe,
     /// Separating speakers.
     Diarize,
+    /// Taking notes on each part of a long transcript (map step of map-reduce).
+    Notes,
+    /// Writing the summary.
+    Summarize,
+    /// Writing the title.
+    Title,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +166,7 @@ pub enum ErrorCode {
     GpuFailed,
     TranscribeFailed,
     DiarizeFailed,
+    SummarizeFailed,
     Cancelled,
 }
 
@@ -172,6 +219,18 @@ pub struct SpeakerEmbedding {
     pub speech_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    /// Markdown, when a template was given.
+    pub markdown: Option<String>,
+    pub title: Option<String>,
+    /// "cuda", "metal" or "cpu".
+    pub backend_used: String,
+    pub elapsed_ms: u64,
+    /// How many parts the transcript was split into (1 = it fit in one pass).
+    pub parts: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpeakerTurn {
     pub start_ms: u64,
@@ -187,6 +246,8 @@ impl Event {
             | Event::Progress { id, .. }
             | Event::Result { id, .. }
             | Event::Diarization { id, .. }
+            | Event::Token { id, .. }
+            | Event::Summary { id, .. }
             | Event::Error { id, .. } => *id,
         }
     }

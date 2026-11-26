@@ -13,7 +13,7 @@ export interface Hardware {
 
 export interface ModelView {
   id: string;
-  category: "transcription" | "vad" | "segmentation" | "embedding";
+  category: "transcription" | "vad" | "segmentation" | "embedding" | "summary";
   name: string;
   description: string;
   sizeBytes: number;
@@ -32,6 +32,7 @@ export interface ModelView {
 export interface ModelsInfo {
   hardware: Hardware;
   recommended: string;
+  recommendedSummary: string;
   models: ModelView[];
 }
 

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{CatalogModel, EVENT_CHANGED, EVENT_PROGRESS, SELECTED_SETTING};
+use super::{CatalogModel, EVENT_CHANGED, EVENT_PROGRESS, SELECTED_SETTING, SUMMARY_SETTING};
 use crate::db::Db;
 
 struct Handle {
@@ -104,16 +104,21 @@ pub fn start(app: &AppHandle, m: &'static CatalogModel) {
         let error = match result {
             Ok(()) => {
                 log::info!("model {} downloaded and verified", m.id);
-                // First transcription model: select it automatically.
+                // First transcription or summary model: select it automatically.
                 let db = app.state::<Db>();
-                if m.category == "transcription"
+                let key = match m.category.as_str() {
+                    "transcription" => Some(SELECTED_SETTING),
+                    "summary" => Some(SUMMARY_SETTING),
+                    _ => None,
+                };
+                if let Some(key) = key
                     && db
-                        .get_setting(SELECTED_SETTING)
+                        .get_setting(key)
                         .ok()
                         .flatten()
                         .is_none_or(|s| s.is_empty())
                 {
-                    let _ = db.set_setting(SELECTED_SETTING, &m.id);
+                    let _ = db.set_setting(key, &m.id);
                 }
                 None
             }
