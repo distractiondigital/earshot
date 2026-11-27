@@ -29,7 +29,7 @@ It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) beca
 - **Calm by design:** light and dark themes, keyboard shortcuts throughout, and a guided first run that downloads the right models for your computer.
 
 <p align="center">
-  <img src="docs/images/screenshot-summary.png" alt="The Summary tab of the same meeting: a short summary, the decisions, and action items with an owner for each">
+  <img src="docs/images/screenshot-meetings.png" alt="The Meetings screen: the Record button with the meeting-audio source picker, a search box for meetings and transcripts, and a list of past meetings with the speakers in each">
 </p>
 
 ## Private by default
