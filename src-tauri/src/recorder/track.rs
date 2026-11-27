@@ -366,12 +366,15 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(1200));
-        let elapsed = clock.elapsed().as_secs_f64();
+        // Finishing pads up to the clock at that moment, which a slow runner reaches well
+        // after `before`; so the track is bounded by the clock read on both sides of it.
+        let before = clock.elapsed().as_secs_f64();
         let stats = w.finish().unwrap();
+        let after = clock.elapsed().as_secs_f64();
         let secs = stats.frames as f64 / 16_000.0;
         assert!(
-            secs <= elapsed && secs >= elapsed - SILENCE_SLACK.as_secs_f64() - 0.05,
-            "{secs} vs {elapsed}"
+            secs <= after && secs >= before - SILENCE_SLACK.as_secs_f64() - 0.05,
+            "{secs} not within {before}..{after}"
         );
     }
 
