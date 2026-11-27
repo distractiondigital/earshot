@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { AudioLines, Settings as SettingsIcon, Users } from "lucide-react";
 import { cn } from "cn";
+import icon from "@/assets/icon.png";
 import { ShortcutsDialog } from "@/components/ShortcutsDialog";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { FOCUS_SEARCH } from "@/lib/events";
@@ -56,7 +57,10 @@ export default function App() {
   return (
     <div className="flex h-screen bg-background text-foreground select-none">
       <nav aria-label="Main" className="flex w-52 shrink-0 flex-col gap-1 border-r border-border bg-sidebar p-3">
-        <div className="px-2 pt-1 pb-4 text-sm font-semibold tracking-tight">Earshot</div>
+        <div className="flex items-center gap-2 px-2 pt-1 pb-4 text-sm font-semibold tracking-tight">
+          <img src={icon} alt="" className="size-6 rounded-md dark:ring-1 dark:ring-white/10" />
+          Earshot
+        </div>
         {NAV.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
