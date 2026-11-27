@@ -113,7 +113,8 @@ export function MeetingView({
   }, [player, onBack]);
 
   const job = jobs[id];
-  const running = meeting?.status === "processing" || job?.status === "running" || job?.status === "queued";
+  const running =
+    (meeting?.status === "processing" && !meeting.elsewhere) || job?.status === "running" || job?.status === "queued";
   const pct = live?.meetingId === id ? live.pct : (job?.progress ?? 0);
   const date = meeting ? new Date(meeting.startedAt) : null;
   const onError = (e: string) => setError(e);

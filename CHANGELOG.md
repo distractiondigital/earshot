@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+- Each meeting is saved in its own folder: the audio, a `meeting.json` with the title, tags, transcript (with word timings and corrections), speakers and summary, and a readable `Transcript.md`.
+- Meetings in a recordings folder shared through cloud storage (Nextcloud, Google Drive, Dropbox, OneDrive, iCloud Drive) appear on every computer that uses it. Edits, new transcripts and summaries, and deletions carry across; when two computers change the same meeting, the later change is kept. Voice profiles stay on each computer and are matched by name.
+- New meeting folders are named by date and time with a short unique id, so meetings from different computers never collide.
+
+### Changed
+
+- Existing meetings get a `meeting.json` in their folder on first launch.
+- An interrupted recording can only be recovered on the computer that made it; other computers show it as interrupted there.
+- The meeting list shows a speaker's voice-profile name when the speaker has no name of their own.
+
 ## 1.1.0
 
 ### Added

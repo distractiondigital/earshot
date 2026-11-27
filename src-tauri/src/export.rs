@@ -391,6 +391,7 @@ mod tests {
             tags: vec!["team".into()],
             language: Some("en".into()),
             speakers: Vec::new(),
+            elsewhere: false,
         }
     }
 

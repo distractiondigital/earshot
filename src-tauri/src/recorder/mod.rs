@@ -27,6 +27,9 @@ pub const EVENT_LEVELS: &str = "recorder://levels";
 pub const EVENT_STOPPED: &str = "recorder://stopped";
 /// Which tracks have heard nothing since they started: `Silence`.
 pub const EVENT_SILENCE: &str = "recorder://silence";
+/// An interrupted meeting from another computer can only be finished there.
+const ELSEWHERE: &str =
+    "This meeting was recorded on another computer. Open Earshot there to recover it.";
 
 /// Seconds of audio each ring buffer holds before samples are dropped.
 const RING_SECONDS: u32 = 10;
@@ -234,9 +237,13 @@ impl Recorder {
 
         let started_at = now_ms();
         let meeting_id = db.create_meeting(started_at, "").map_err(err)?;
-        let dir = recordings_dir(app)?.join(format!("meeting-{meeting_id}"));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+        let uid = db.meeting_uid(meeting_id).map_err(err)?;
+        let dir = recordings_dir(app)?.join(crate::library::folder_name(started_at, &uid));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let _ = db.set_meeting_status(meeting_id, "failed", Some(0), Some(&e.to_string()));
+            return Err(format!("Cannot create {}: {e}", dir.display()));
+        }
+        db.set_meeting_folder(meeting_id, &dir).map_err(err)?;
 
         let clock = Arc::new(Clock::start());
         let mut tracks = Vec::new();
@@ -362,6 +369,9 @@ impl Recorder {
         if meeting.status != "incomplete" {
             return Err(format!("Meeting is {}, not interrupted", meeting.status));
         }
+        if meeting.elsewhere {
+            return Err(ELSEWHERE.into());
+        }
         let rows = db.tracks(meeting_id).map_err(err)?;
         let stopped_at = last_write_ms(&rows).unwrap_or_else(now_ms);
 
@@ -463,7 +473,10 @@ impl Recorder {
 
         let dir = match dir {
             Some(d) => d,
-            None => recordings_dir(app)?.join(format!("meeting-{meeting_id}")),
+            None => match db.meeting_folder(meeting_id).map_err(err)? {
+                Some(f) => PathBuf::from(f),
+                None => recordings_dir(app)?.join(format!("meeting-{meeting_id}")),
+            },
         };
         let (levels_stop, levels_join) = spawn_levels(app.clone(), clock.clone(), &tracks);
         *guard = Some(Session {
@@ -771,7 +784,11 @@ pub struct Interrupted {
 
 /// The most recently interrupted meeting, if any.
 pub fn interrupted(db: &Db) -> Option<Interrupted> {
-    let m = db.latest_meeting_with_status("incomplete").ok().flatten()?;
+    let m = db
+        .list_meetings()
+        .ok()?
+        .into_iter()
+        .find(|m| m.status == "incomplete" && !m.elsewhere)?;
     let tracks = db.tracks(m.id).ok()?;
     Some(Interrupted {
         meeting_id: m.id,
@@ -905,6 +922,13 @@ pub fn recover(db: &Db, meeting_id: i64) -> Result<i64, String> {
         .ok_or("Meeting not found")?;
     if status != "incomplete" {
         return Err(format!("Meeting is {status}, not incomplete"));
+    }
+    if db
+        .meeting(meeting_id)
+        .map_err(err)?
+        .is_some_and(|m| m.elsewhere)
+    {
+        return Err(ELSEWHERE.into());
     }
     let mut longest = 0i64;
     let mut recovered_any = false;

@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod export;
 mod hotkey;
+mod library;
 mod mixdown;
 mod models;
 mod pill;
@@ -72,6 +73,8 @@ pub fn run() {
             app.manage(models::download::Downloads::default());
             let processor = processing::Processor::start(app.handle());
             app.manage(processor);
+            let library = library::Library::start(app.handle());
+            app.manage(library);
             tray::build(app.handle())?;
             hotkey::register_saved(app.handle());
             // Speaker models arrived after some transcription models were downloaded (M3):
@@ -107,6 +110,7 @@ pub fn run() {
             commands::update_meeting,
             commands::recover_meeting,
             commands::recordings_dir,
+            commands::sync_library,
             commands::choose_recordings_dir,
             commands::open_recordings_dir,
             commands::open_link,

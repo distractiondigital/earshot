@@ -69,6 +69,8 @@ export interface Meeting {
   language: string | null;
   /** Remote speakers by name (or "Speaker N"), most talkative first. */
   speakers: string[];
+  /** Recorded on another computer and read in from its folder. */
+  elsewhere: boolean;
 }
 
 export interface Interrupted {
@@ -105,6 +107,8 @@ export const recorder = {
   recordingsDir: () => invoke<string>("recordings_dir"),
   chooseRecordingsDir: () => invoke<string | null>("choose_recordings_dir"),
   openRecordingsDir: () => invoke<void>("open_recordings_dir"),
+  /** Look for meetings added, changed or deleted on other computers now. */
+  syncLibrary: () => invoke<void>("sync_library"),
   getHotkey: () => invoke<string>("get_hotkey"),
   setHotkey: (hotkey: string) => invoke<void>("set_hotkey", { hotkey }),
 };

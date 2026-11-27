@@ -17,7 +17,7 @@
 
 Earshot is a meeting recorder for people who would rather be in the conversation than taking notes about it. Start a recording from the app, the tray or a keyboard shortcut, and Earshot keeps your microphone and the meeting's audio as separate tracks. When you stop, it transcribes them, works out who said what, and writes a summary with the decisions and action items.
 
-It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) because it records the audio on your computer, with no bot joining the call. And everything happens on your own computer: speech recognition, speaker detection and summaries all run locally on your graphics card or processor. Your recordings and transcripts never leave your machine. There are no accounts, no subscriptions and no per-minute fees.
+It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) because it records the audio on your computer, with no bot joining the call. And everything happens on your own computer: speech recognition, speaker detection and summaries all run locally on your graphics card or processor. Your recordings and transcripts stay on your machine, unless you choose to keep them in a cloud folder of your own. There are no accounts, no subscriptions and no per-minute fees.
 
 ## Features
 
@@ -26,6 +26,7 @@ It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) beca
 - **Speakers:** everything from your mic is you; the meeting audio is split into its separate voices. Rename, merge and reassign speakers, and save a voice so Earshot suggests that person's name in future meetings.
 - **Review:** an audio player synced to the transcript. Click any word to hear it, correct the text in place, and mute either track. Search across every meeting, and export transcripts to Markdown, text, SRT, VTT or JSON, and audio as separate lossless tracks or a single mix (FLAC or MP3).
 - **Summaries:** a local AI model (Qwen) writes a summary, decisions, action items and open questions as soon as the transcript is ready. Choose from templates for general meetings, client calls, interviews, one-on-ones and brainstorms, or write your own. Untitled meetings get a short title automatically.
+- **Your files:** each meeting is a plain folder with its audio, a `meeting.json` holding the transcript, speakers and summary, and a readable `Transcript.md`. Put the recordings folder in Nextcloud, Google Drive, Dropbox, OneDrive or iCloud Drive and every computer running Earshot shows the same meetings, with edits and deletions carried across.
 - **Calm by design:** light and dark themes, keyboard shortcuts throughout, and a guided first run that downloads the right models for your computer.
 
 <p align="center">

@@ -103,7 +103,16 @@ export function RecordingSettings() {
         />
       </SettingsRow>
 
-      <SettingsRow label="Recordings folder" hint={dir}>
+      <SettingsRow
+        label="Recordings folder"
+        hint={
+          <>
+            <span className="block break-all">{dir}</span>
+            Each meeting is a folder with its audio, transcript and summary. Keep this folder in Nextcloud, Google Drive
+            or similar to see your meetings on every computer.
+          </>
+        }
+      >
         <div className="flex shrink-0 gap-2">
           <Button variant="outline" size="sm" onClick={() => recorder.openRecordingsDir().catch((e) => setError(String(e)))}>
             <FolderOpen aria-hidden />

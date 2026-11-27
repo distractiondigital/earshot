@@ -6,6 +6,7 @@ import icon from "@/assets/icon.png";
 import { ShortcutsDialog } from "@/components/ShortcutsDialog";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { FOCUS_SEARCH } from "@/lib/events";
+import { recorder } from "@/lib/recorder";
 import { MeetingView } from "@/screens/MeetingView";
 import { Meetings } from "@/screens/Meetings";
 // Settings and Speakers load when first opened, keeping the startup bundle small.
@@ -41,6 +42,19 @@ export default function App() {
     });
     return () => {
       un.then((f) => f());
+    };
+  }, []);
+
+  // Coming back to the window picks up meetings changed on other computers right away.
+  useEffect(() => {
+    const sync = () => {
+      if (document.visibilityState === "visible") recorder.syncLibrary().catch(() => {});
+    };
+    window.addEventListener("focus", sync);
+    document.addEventListener("visibilitychange", sync);
+    return () => {
+      window.removeEventListener("focus", sync);
+      document.removeEventListener("visibilitychange", sync);
     };
   }, []);
 

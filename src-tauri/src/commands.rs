@@ -645,7 +645,7 @@ pub fn search_transcripts(
     db.search(&query, 200).map_err(err)
 }
 
-fn me_name(db: &Db) -> String {
+pub(crate) fn me_name(db: &Db) -> String {
     db.get_setting("speakers.meName")
         .ok()
         .flatten()
@@ -812,19 +812,20 @@ pub fn delete_meeting(app: AppHandle, id: i64) -> Result<(), String> {
         return Err("Stop the recording before deleting this meeting.".into());
     }
     app.state::<crate::processing::Processor>().cancel(&app, id);
-    let paths = app.state::<Db>().delete_meeting(id).map_err(err)?;
-    for p in &paths {
-        let path = std::path::Path::new(p);
-        if let Err(e) = std::fs::remove_file(path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            log::warn!("couldn't delete {}: {e}", path.display());
-        }
-        // Remove the meeting's own folder once it's empty (never a non-empty or shared one).
-        if let Some(dir) = path.parent()
-            && dir.file_name().and_then(|n| n.to_str()) == Some(&format!("meeting-{id}"))
-        {
-            let _ = std::fs::remove_dir(dir);
+    let db = app.state::<Db>();
+    let folder = db.meeting_folder(id).map_err(err)?;
+    let paths = db.delete_meeting(id).map_err(err)?;
+    match folder {
+        // Its folder goes too (on every computer that shares it), unless other files are in it.
+        Some(dir) => crate::library::remove_folder(std::path::Path::new(&dir), &paths),
+        None => {
+            for p in &paths {
+                if let Err(e) = std::fs::remove_file(p)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!("couldn't delete {p}: {e}");
+                }
+            }
         }
     }
     log::info!("meeting {id} deleted");
@@ -832,6 +833,39 @@ pub fn delete_meeting(app: AppHandle, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// The transcript and summary as Markdown, saved in the meeting's folder for reading in any app.
+/// `None` while there is neither.
+pub(crate) fn readable_transcript(db: &Db, id: i64) -> Option<String> {
+    let meeting = db.meeting(id).ok()??;
+    let lines = db.transcript(id).ok()?;
+    let summary = db.summary(id).ok()?;
+    if lines.is_empty() && summary.is_none() {
+        return None;
+    }
+    let me = me_name(db);
+    let when = chrono::DateTime::from_timestamp_millis(meeting.started_at)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%A %-d %B %Y, %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    let doc = crate::export::Doc {
+        meeting: &meeting,
+        lines: &lines,
+        me_name: &me,
+        when,
+        summary: summary.as_ref().map(|s| s.markdown.as_str()),
+    };
+    Some(crate::export::render(&doc, crate::export::Format::Markdown))
+}
+
+/// Looks for meetings added, changed or deleted on other computers now (the page calls this when
+/// the window comes back into focus).
+#[tauri::command]
+pub fn sync_library(library: State<'_, crate::library::Library>) {
+    library.sync();
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackAudio {
@@ -899,6 +933,8 @@ pub async fn choose_recordings_dir(app: AppHandle) -> Result<Option<String>, Str
         app.state::<Db>()
             .set_setting("recording.dir", &path)
             .map_err(err)?;
+        // Meetings already in the new folder (from another computer) show up right away.
+        app.state::<crate::library::Library>().sync();
         Ok(Some(path))
     })
     .await

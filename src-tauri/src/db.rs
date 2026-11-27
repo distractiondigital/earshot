@@ -1,5 +1,6 @@
 //! SQLite storage: connection setup and schema migrations.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -15,6 +16,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("../migrations/0004_jobs.sql")),
         M::up(include_str!("../migrations/0005_voice_profiles.sql")),
         M::up(include_str!("../migrations/0006_summaries.sql")),
+        M::up(include_str!("../migrations/0007_library.sql")),
     ])
 });
 
@@ -40,6 +42,8 @@ pub struct MeetingRow {
     pub language: Option<String>,
     /// Remote speakers by name (or "Speaker N"), most talkative first, for the list's chips.
     pub speakers: Vec<String>,
+    /// Recorded on another computer (read in from its folder).
+    pub elsewhere: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -218,6 +222,7 @@ pub enum DbError {
 
 pub struct Db {
     conn: Mutex<Connection>,
+    device: std::sync::OnceLock<String>,
 }
 
 impl Db {
@@ -238,6 +243,7 @@ impl Db {
         MIGRATIONS.to_latest(&mut conn)?;
         let db = Self {
             conn: Mutex::new(conn),
+            device: std::sync::OnceLock::new(),
         };
         db.ensure_builtin_templates()?;
         Ok(db)
@@ -278,9 +284,9 @@ impl Db {
     pub fn create_meeting(&self, started_at: i64, title: &str) -> Result<i64, DbError> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO meetings (title, started_at, status, created_at, updated_at)
-             VALUES (?1, ?2, 'recording', ?2, ?2)",
-            params![title, started_at],
+            "INSERT INTO meetings (title, started_at, status, created_at, updated_at, uid)
+             VALUES (?1, ?2, 'recording', ?2, ?2, ?3)",
+            params![title, started_at, crate::library::new_uid()],
         )?;
         Ok(c.last_insert_rowid())
     }
@@ -347,13 +353,6 @@ impl Db {
 
     pub fn meeting(&self, id: i64) -> Result<Option<MeetingRow>, DbError> {
         Ok(self.list_meetings()?.into_iter().find(|m| m.id == id))
-    }
-
-    pub fn latest_meeting_with_status(&self, status: &str) -> Result<Option<MeetingRow>, DbError> {
-        Ok(self
-            .list_meetings()?
-            .into_iter()
-            .find(|m| m.status == status))
     }
 
     /// Marks a track as being written again (continuing an interrupted meeting).
@@ -473,7 +472,7 @@ impl Db {
             [now_ms()],
         )?;
         c.execute(
-            "UPDATE meetings SET status = 'queued' WHERE status = 'processing'",
+            "UPDATE meetings SET status = 'queued' WHERE status = 'processing' AND device IS NULL",
             [],
         )?;
         Ok(n)
@@ -599,7 +598,9 @@ impl Db {
     pub fn speakers(&self, meeting_id: i64) -> Result<Vec<SpeakerRow>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT s.id, s.label, s.display_name, s.is_me,
+            "SELECT s.id, s.label,
+                    coalesce(s.display_name, CASE WHEN s.profile_id IS NULL THEN s.profile_name END),
+                    s.is_me,
                     coalesce(sum(u.end_ms - u.start_ms), 0), count(u.id),
                     s.profile_id, p.name, s.auto_matched, s.embedding IS NOT NULL
              FROM speakers s
@@ -631,7 +632,7 @@ impl Db {
     /// Sets (or with `None`, clears) the name shown for a speaker.
     pub fn rename_speaker(&self, speaker_id: i64, name: Option<&str>) -> Result<(), DbError> {
         self.conn().execute(
-            "UPDATE speakers SET display_name = ?2 WHERE id = ?1",
+            "UPDATE speakers SET display_name = ?2, profile_name = NULL WHERE id = ?1",
             params![speaker_id, name],
         )?;
         Ok(())
@@ -722,11 +723,12 @@ impl Db {
     ) -> Result<Vec<crate::speakers::OldSpeaker>, DbError> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT s.id, s.display_name, u.start_ms, u.end_ms,
+            "SELECT s.id, coalesce(s.display_name, s.profile_name), u.start_ms, u.end_ms,
                     CASE WHEN s.auto_matched = 0 THEN s.profile_id END
              FROM speakers s JOIN utterances u ON u.speaker_id = s.id
              WHERE s.meeting_id = ?1 AND s.is_me = 0
-               AND (s.display_name IS NOT NULL OR (s.profile_id IS NOT NULL AND s.auto_matched = 0))
+               AND (s.display_name IS NOT NULL OR s.profile_name IS NOT NULL
+                    OR (s.profile_id IS NOT NULL AND s.auto_matched = 0))
              ORDER BY s.id, u.start_ms",
         )?;
         let mut out: Vec<(i64, crate::speakers::OldSpeaker)> = Vec::new();
@@ -833,7 +835,7 @@ impl Db {
             params![meeting_id, profile_id, speaker_id],
         )?;
         tx.execute(
-            "UPDATE speakers SET profile_id = ?2, auto_matched = 0 WHERE id = ?1",
+            "UPDATE speakers SET profile_id = ?2, auto_matched = 0, profile_name = NULL WHERE id = ?1",
             params![speaker_id, profile_id],
         )?;
         // Replace any earlier sample from this meeting, then keep the newest few.
@@ -863,7 +865,7 @@ impl Db {
     /// Rejects a suggested match: the speaker goes back to "Speaker N".
     pub fn unlink_speaker(&self, speaker_id: i64) -> Result<(), DbError> {
         self.conn().execute(
-            "UPDATE speakers SET profile_id = NULL, auto_matched = 0 WHERE id = ?1",
+            "UPDATE speakers SET profile_id = NULL, auto_matched = 0, profile_name = NULL WHERE id = ?1",
             [speaker_id],
         )?;
         Ok(())
@@ -992,7 +994,8 @@ impl Db {
         let c = self.conn();
         let mut stmt = c.prepare(
             "SELECT u.id, u.track_kind, u.start_ms, u.end_ms, u.text,
-                    u.speaker_id, s.label, coalesce(s.display_name, p.name), coalesce(s.is_me, 0), u.edited,
+                    u.speaker_id, s.label, coalesce(s.display_name, p.name, s.profile_name),
+                    coalesce(s.is_me, 0), u.edited,
                     s.display_name IS NULL AND coalesce(s.auto_matched, 0) != 0
              FROM utterances u
              LEFT JOIN speakers s ON s.id = u.speaker_id
@@ -1039,7 +1042,8 @@ impl Db {
     /// Meetings left in `recording` by a crash become `incomplete` (offered for recovery).
     pub fn mark_interrupted(&self) -> Result<usize, DbError> {
         Ok(self.conn().execute(
-            "UPDATE meetings SET status = 'incomplete', updated_at = ?1 WHERE status = 'recording'",
+            "UPDATE meetings SET status = 'incomplete', updated_at = ?1
+             WHERE status = 'recording' AND device IS NULL",
             [now_ms()],
         )?)
     }
@@ -1050,11 +1054,13 @@ impl Db {
             "SELECT m.id, m.title, m.started_at, m.duration_ms, m.status, m.error,
                     m.remote_speaker_count_hint, m.tags, m.language,
                     (SELECT json_group_array(name) FROM (
-                        SELECT coalesce(s.display_name, s.label) AS name
+                        SELECT coalesce(s.display_name, p.name, s.profile_name, s.label) AS name
                         FROM speakers s LEFT JOIN utterances u ON u.speaker_id = s.id
+                        LEFT JOIN speaker_profiles p ON p.id = s.profile_id AND s.auto_matched = 0
                         WHERE s.meeting_id = m.id AND s.is_me = 0
                         GROUP BY s.id
-                        ORDER BY coalesce(sum(u.end_ms - u.start_ms), 0) DESC))
+                        ORDER BY coalesce(sum(u.end_ms - u.start_ms), 0) DESC)),
+                    m.device IS NOT NULL
              FROM meetings m ORDER BY m.started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1073,6 +1079,7 @@ impl Db {
                 speakers: speakers
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
+                elsewhere: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1430,6 +1437,539 @@ impl Db {
              WHERE id = ?1 AND (trim(title) = '' OR title_generated)",
             params![meeting_id, title, now_ms()],
         )? > 0)
+    }
+}
+
+/// What the library needs to know about a meeting to save or read its folder.
+#[derive(Debug, Clone)]
+pub struct LibraryEntry {
+    pub id: i64,
+    pub uid: String,
+    pub folder: Option<String>,
+    pub status: String,
+    pub file_hash: Option<String>,
+    pub file_stamp: Option<String>,
+}
+
+// ---- Meeting folders (see library.rs) ----
+impl Db {
+    /// This computer's id, made on first use.
+    pub fn device_id(&self) -> String {
+        self.device
+            .get_or_init(|| {
+                if let Ok(Some(id)) = self.get_setting("device.id")
+                    && !id.is_empty()
+                {
+                    return id;
+                }
+                let id = crate::library::new_uid();
+                if let Err(e) = self.set_setting("device.id", &id) {
+                    log::warn!("couldn't save this computer's id: {e}");
+                }
+                id
+            })
+            .clone()
+    }
+
+    /// Gives meetings from before 1.2 an id and their folder (where their audio is), and marks
+    /// any meeting that was never saved to its folder to be saved.
+    pub fn prepare_library(&self) -> Result<(), DbError> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let missing: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM meetings WHERE uid IS NULL")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        for id in missing {
+            tx.execute(
+                "UPDATE meetings SET uid = ?2 WHERE id = ?1",
+                params![id, crate::library::new_uid()],
+            )?;
+        }
+        let no_folder: Vec<(i64, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT m.id, (SELECT t.path FROM tracks t WHERE t.meeting_id = m.id ORDER BY t.id LIMIT 1)
+                 FROM meetings m WHERE m.folder IS NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        for (id, track) in no_folder {
+            if let Some(dir) = track.as_deref().and_then(|t| Path::new(t).parent()) {
+                tx.execute(
+                    "UPDATE meetings SET folder = ?2 WHERE id = ?1",
+                    params![id, dir.display().to_string()],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO library_dirty
+                 SELECT id, 0 FROM meetings WHERE file_hash IS NULL AND folder IS NOT NULL",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn meeting_uid(&self, id: i64) -> Result<String, DbError> {
+        Ok(self
+            .conn()
+            .query_row("SELECT uid FROM meetings WHERE id = ?1", [id], |r| r.get(0))?)
+    }
+
+    pub fn set_meeting_folder(&self, id: i64, folder: &Path) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE meetings SET folder = ?2 WHERE id = ?1",
+            params![id, folder.display().to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn meeting_folder(&self, id: i64) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn()
+            .query_row("SELECT folder FROM meetings WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// Meetings changed since they were saved, with when.
+    pub fn library_dirty(&self) -> Result<Vec<(i64, i64)>, DbError> {
+        let c = self.conn();
+        let mut stmt =
+            c.prepare("SELECT meeting_id, changed_at FROM library_dirty ORDER BY changed_at")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Done saving a change; a newer change since `changed_at` stays queued.
+    pub fn clear_library_dirty(&self, id: i64, changed_at: i64) -> Result<(), DbError> {
+        self.conn().execute(
+            "DELETE FROM library_dirty WHERE meeting_id = ?1 AND changed_at <= ?2",
+            params![id, changed_at],
+        )?;
+        Ok(())
+    }
+
+    fn library_entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryEntry> {
+        Ok(LibraryEntry {
+            id: r.get(0)?,
+            uid: r.get(1)?,
+            folder: r.get(2)?,
+            status: r.get(3)?,
+            file_hash: r.get(4)?,
+            file_stamp: r.get(5)?,
+        })
+    }
+
+    pub fn library_entry(&self, id: i64) -> Result<Option<LibraryEntry>, DbError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, uid, folder, status, file_hash, file_stamp FROM meetings
+                 WHERE id = ?1 AND uid IS NOT NULL",
+                [id],
+                Self::library_entry_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn library_entries(&self) -> Result<Vec<LibraryEntry>, DbError> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT id, uid, folder, status, file_hash, file_stamp FROM meetings
+             WHERE uid IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], Self::library_entry_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records what the meeting's file holds now (written or read here).
+    pub fn set_library_file(&self, id: i64, hash: &str, stamp: &str) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE meetings SET file_hash = ?2, file_stamp = ?3 WHERE id = ?1",
+            params![id, hash, stamp],
+        )?;
+        Ok(())
+    }
+
+    /// The meeting's file is gone from its folder: save it again.
+    pub fn forget_library_file(&self, id: i64) -> Result<(), DbError> {
+        let c = self.conn();
+        c.execute(
+            "UPDATE meetings SET file_hash = NULL, file_stamp = NULL WHERE id = ?1",
+            [id],
+        )?;
+        c.execute("INSERT OR IGNORE INTO library_dirty VALUES (?1, 0)", [id])?;
+        Ok(())
+    }
+
+    pub fn has_active_job(&self, meeting_id: i64) -> Result<bool, DbError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE meeting_id = ?1 AND status IN ('queued', 'running'))",
+            [meeting_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Everything about a meeting, as saved in its folder.
+    pub fn meeting_file(&self, id: i64) -> Result<Option<crate::library::MeetingFile>, DbError> {
+        use crate::library::{FileSpeaker, FileSummary, FileTrack, FileUtterance, FileVoice};
+        let device = self.device_id();
+        let c = self.conn();
+        let Some(mut file) = c
+            .query_row(
+                "SELECT uid, coalesce(device, ?2), title, title_generated, started_at, duration_ms,
+                        status, error, language, remote_speaker_count_hint, tags
+                 FROM meetings WHERE id = ?1 AND uid IS NOT NULL",
+                params![id, device],
+                |r| {
+                    let tags: String = r.get(10)?;
+                    Ok(crate::library::MeetingFile {
+                        format: crate::library::FORMAT,
+                        uid: r.get(0)?,
+                        device: r.get(1)?,
+                        saved_at: 0,
+                        title: r.get(2)?,
+                        title_generated: r.get(3)?,
+                        started_at: r.get(4)?,
+                        duration_ms: r.get(5)?,
+                        status: r.get(6)?,
+                        error: r.get(7)?,
+                        language: r.get(8)?,
+                        speaker_count_hint: r.get(9)?,
+                        tags: serde_json::from_str(&tags).unwrap_or_default(),
+                        tracks: Vec::new(),
+                        speakers: Vec::new(),
+                        utterances: Vec::new(),
+                        summary: None,
+                    })
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let mut stmt = c.prepare(
+            "SELECT kind, path, sample_rate, channels, duration_ms, finalized, start_offset_ms,
+                    source, source_spec
+             FROM tracks WHERE meeting_id = ?1 ORDER BY kind",
+        )?;
+        file.tracks = stmt
+            .query_map([id], |r| {
+                let path: String = r.get(1)?;
+                Ok(FileTrack {
+                    kind: r.get(0)?,
+                    file: Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or(path),
+                    sample_rate: r.get(2)?,
+                    channels: r.get(3)?,
+                    duration_ms: r.get(4)?,
+                    finalized: r.get(5)?,
+                    start_offset_ms: r.get(6)?,
+                    source: r.get(7)?,
+                    source_spec: r.get(8)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        let mut stmt = c.prepare(
+            "SELECT s.id, s.label, s.display_name, s.is_me, s.color, coalesce(p.name, s.profile_name),
+                    s.auto_matched AND p.id IS NOT NULL, s.embedding_model, s.embedding, s.speech_ms
+             FROM speakers s LEFT JOIN speaker_profiles p ON p.id = s.profile_id
+             WHERE s.meeting_id = ?1 ORDER BY s.id",
+        )?;
+        let speakers: Vec<(i64, FileSpeaker)> = stmt
+            .query_map([id], |r| {
+                let model: Option<String> = r.get(7)?;
+                let blob: Option<Vec<u8>> = r.get(8)?;
+                Ok((
+                    r.get(0)?,
+                    FileSpeaker {
+                        label: r.get(1)?,
+                        name: r.get(2)?,
+                        is_me: r.get(3)?,
+                        color: r.get(4)?,
+                        profile: r.get(5)?,
+                        auto_matched: r.get(6)?,
+                        voice: match (model, blob) {
+                            (Some(model), Some(blob)) => Some(FileVoice {
+                                model,
+                                vector: crate::profiles::from_blob(&blob),
+                                speech_ms: r.get(9)?,
+                            }),
+                            _ => None,
+                        },
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        let index: HashMap<i64, usize> = speakers
+            .iter()
+            .enumerate()
+            .map(|(i, (sid, _))| (*sid, i))
+            .collect();
+        file.speakers = speakers.into_iter().map(|(_, s)| s).collect();
+
+        let mut stmt = c.prepare(
+            "SELECT id, track_kind, speaker_id, start_ms, end_ms, text, edited
+             FROM utterances WHERE meeting_id = ?1 ORDER BY start_ms, id",
+        )?;
+        let mut words = c.prepare(
+            "SELECT start_ms, end_ms, text, prob FROM words WHERE utterance_id = ?1
+             ORDER BY start_ms, id",
+        )?;
+        let rows: Vec<(i64, FileUtterance)> = stmt
+            .query_map([id], |r| {
+                let speaker: Option<i64> = r.get(2)?;
+                Ok((
+                    r.get(0)?,
+                    FileUtterance {
+                        track: r.get(1)?,
+                        speaker: speaker.and_then(|s| index.get(&s).copied()),
+                        start_ms: r.get(3)?,
+                        end_ms: r.get(4)?,
+                        text: r.get(5)?,
+                        edited: r.get(6)?,
+                        words: Vec::new(),
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (uid, mut u) in rows {
+            u.words = words
+                .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<Result<_, _>>()?;
+            file.utterances.push(u);
+        }
+
+        file.summary = c
+            .query_row(
+                "SELECT markdown, template_name, model_id, created_at, updated_at, edited
+                 FROM summaries WHERE meeting_id = ?1",
+                [id],
+                |r| {
+                    Ok(FileSummary {
+                        markdown: r.get(0)?,
+                        template: r.get(1)?,
+                        model: r.get(2)?,
+                        created_at: r.get(3)?,
+                        updated_at: r.get(4)?,
+                        edited: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(Some(file))
+    }
+
+    /// Adds or replaces a meeting from its folder's file (matched by its id); voice profiles are
+    /// matched by name. Returns the meeting's id here.
+    pub fn import_meeting_file(
+        &self,
+        f: &crate::library::MeetingFile,
+        dir: &Path,
+        hash: &str,
+        stamp: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let here = self.device_id();
+        let device = f.device.as_deref().filter(|d| *d != here);
+        // Only the computer that made a recording can continue it.
+        let status = match f.status.as_str() {
+            "recording" => "incomplete",
+            s @ ("incomplete" | "queued" | "processing" | "ready" | "failed") => s,
+            _ => "failed",
+        };
+        let tags = serde_json::to_string(&f.tags).unwrap_or_else(|_| "[]".into());
+        let folder = dir.display().to_string();
+        let now = now_ms();
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let existing: Option<i64> = tx
+            .query_row("SELECT id FROM meetings WHERE uid = ?1", [&f.uid], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let id = match existing {
+            Some(id) => {
+                tx.execute(
+                    "UPDATE meetings SET title = ?2, title_generated = ?3, started_at = ?4,
+                         duration_ms = ?5, status = ?6, error = ?7, language = ?8,
+                         remote_speaker_count_hint = ?9, tags = ?10, updated_at = ?11
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        f.title,
+                        f.title_generated,
+                        f.started_at,
+                        f.duration_ms,
+                        status,
+                        f.error,
+                        f.language,
+                        f.speaker_count_hint,
+                        tags,
+                        now
+                    ],
+                )?;
+                tx.execute("DELETE FROM tracks WHERE meeting_id = ?1", [id])?;
+                tx.execute("DELETE FROM utterances WHERE meeting_id = ?1", [id])?;
+                tx.execute("DELETE FROM speakers WHERE meeting_id = ?1", [id])?;
+                tx.execute("DELETE FROM summaries WHERE meeting_id = ?1", [id])?;
+                id
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO meetings (uid, title, title_generated, started_at, duration_ms,
+                         status, error, language, remote_speaker_count_hint, tags, created_at,
+                         updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                    params![
+                        f.uid,
+                        f.title,
+                        f.title_generated,
+                        f.started_at,
+                        f.duration_ms,
+                        status,
+                        f.error,
+                        f.language,
+                        f.speaker_count_hint,
+                        tags,
+                        now
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        tx.execute(
+            "UPDATE meetings SET folder = ?2, device = ?3, file_hash = ?4, file_stamp = ?5
+             WHERE id = ?1",
+            params![id, folder, device, hash, stamp],
+        )?;
+
+        let mut kinds = std::collections::HashSet::new();
+        for t in &f.tracks {
+            // Plain file names in the meeting's own folder only, one track per kind.
+            let plain = Path::new(&t.file).file_name().and_then(|n| n.to_str()) == Some(&t.file);
+            if !plain
+                || !matches!(t.kind.as_str(), "mic" | "system")
+                || !kinds.insert(t.kind.as_str())
+            {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO tracks (meeting_id, kind, path, sample_rate, channels, duration_ms,
+                     finalized, start_offset_ms, source, source_spec)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    id,
+                    t.kind,
+                    dir.join(&t.file).display().to_string(),
+                    t.sample_rate,
+                    t.channels,
+                    t.duration_ms,
+                    t.finalized,
+                    t.start_offset_ms,
+                    t.source,
+                    t.source_spec
+                ],
+            )?;
+        }
+
+        let mut speaker_ids = Vec::with_capacity(f.speakers.len());
+        for sp in &f.speakers {
+            let profile_id: Option<i64> = match &sp.profile {
+                Some(name) if !sp.is_me => tx
+                    .query_row(
+                        "SELECT id FROM speaker_profiles WHERE lower(name) = lower(?1)
+                         ORDER BY id LIMIT 1",
+                        [name],
+                        |r| r.get(0),
+                    )
+                    .optional()?,
+                _ => None,
+            };
+            // A confirmed profile this computer doesn't have still names the speaker.
+            let profile_name = sp
+                .profile
+                .as_ref()
+                .filter(|_| profile_id.is_none() && !sp.auto_matched && !sp.is_me);
+            let (model, blob) = match &sp.voice {
+                Some(v) => (
+                    Some(v.model.as_str()),
+                    Some(crate::profiles::to_blob(&v.vector)),
+                ),
+                None => (None, None),
+            };
+            tx.execute(
+                "INSERT INTO speakers (meeting_id, label, display_name, profile_id, is_me,
+                     auto_matched, color, embedding, embedding_model, speech_ms, profile_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id,
+                    sp.label,
+                    sp.name,
+                    profile_id,
+                    sp.is_me,
+                    sp.auto_matched && profile_id.is_some(),
+                    sp.color,
+                    blob,
+                    model,
+                    sp.voice.as_ref().map_or(0, |v| v.speech_ms),
+                    profile_name
+                ],
+            )?;
+            speaker_ids.push(tx.last_insert_rowid());
+        }
+
+        {
+            let mut ins_u = tx.prepare(
+                "INSERT INTO utterances (meeting_id, speaker_id, track_kind, start_ms, end_ms, text, edited)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut ins_w = tx.prepare(
+                "INSERT INTO words (utterance_id, start_ms, end_ms, text, prob) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for u in &f.utterances {
+                if !matches!(u.track.as_str(), "mic" | "system") {
+                    continue;
+                }
+                let speaker = u.speaker.and_then(|i| speaker_ids.get(i).copied());
+                ins_u.execute(params![
+                    id, speaker, u.track, u.start_ms, u.end_ms, u.text, u.edited
+                ])?;
+                let uid = tx.last_insert_rowid();
+                for (s, e, text, prob) in &u.words {
+                    ins_w.execute(params![uid, s, e, text, prob])?;
+                }
+            }
+        }
+
+        if let Some(s) = &f.summary {
+            tx.execute(
+                "INSERT INTO summaries (meeting_id, template_id, template_name, model_id, markdown,
+                     created_at, updated_at, edited)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    s.template,
+                    s.model,
+                    s.markdown,
+                    s.created_at,
+                    s.updated_at,
+                    s.edited
+                ],
+            )?;
+        }
+        // What was just read in is already saved.
+        tx.execute("DELETE FROM library_dirty WHERE meeting_id = ?1", [id])?;
+        tx.commit()?;
+        Ok(id)
     }
 }
 
@@ -1922,7 +2462,7 @@ mod tests {
     #[test]
     fn migrates_to_latest() {
         let db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 6);
+        assert_eq!(db.schema_version().unwrap(), 7);
     }
 
     #[test]
@@ -2117,5 +2657,48 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2);
         assert!(db.transcript(m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn meetings_from_before_folders_get_an_id_and_their_folder() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.create_meeting(1_000, "Old").unwrap();
+        let dir = Path::new("recordings").join(format!("meeting-{old}"));
+        db.add_track(
+            old,
+            "mic",
+            &dir.join("mic.flac").display().to_string(),
+            48_000,
+            1,
+            "Mic",
+            None,
+        )
+        .unwrap();
+        let no_audio = db.create_meeting(2_000, "Failed").unwrap();
+        // As a 1.1 database looks after the upgrade.
+        db.conn()
+            .execute_batch("UPDATE meetings SET uid = NULL; DELETE FROM library_dirty;")
+            .unwrap();
+
+        db.prepare_library().unwrap();
+        let uid = db.meeting_uid(old).unwrap();
+        assert_eq!(uid.len(), 32);
+        assert_ne!(uid, db.meeting_uid(no_audio).unwrap());
+        assert_eq!(
+            db.meeting_folder(old).unwrap(),
+            Some(dir.display().to_string())
+        );
+        assert_eq!(db.meeting_folder(no_audio).unwrap(), None);
+        // Only the meeting with a folder is waiting to be saved.
+        let dirty: Vec<i64> = db
+            .library_dirty()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.0)
+            .collect();
+        assert_eq!(dirty, [old]);
+        // Running it again changes nothing.
+        db.prepare_library().unwrap();
+        assert_eq!(db.meeting_uid(old).unwrap(), uid);
     }
 }

@@ -1286,6 +1286,7 @@ name = "earshot"
 version = "1.1.0"
 dependencies = [
  "audioadapter-buffers",
+ "chrono",
  "cpal",
  "earshot-protocol",
  "flacenc",
@@ -1314,6 +1315,7 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.21",
  "tokio",
+ "uuid",
  "wasapi",
 ]
 

@@ -462,7 +462,9 @@ function MeetingRow({
   };
   const date = new Date(m.startedAt);
   const waiting = job?.status === "queued";
-  const running = m.status === "processing" || job?.status === "running";
+  // Another computer's progress isn't visible here, only its result once it saves.
+  const elsewhere = m.elsewhere && !job && (m.status === "processing" || m.status === "incomplete");
+  const running = (m.status === "processing" && !elsewhere) || job?.status === "running";
   const pct = Math.round(livePct ?? job?.progress ?? 0);
   return (
     <li className="flex items-center gap-4 py-3">
@@ -494,7 +496,11 @@ function MeetingRow({
           </div>
         )}
       </button>
-      {m.status === "incomplete" ? (
+      {elsewhere ? (
+        <span className="w-40 text-right text-xs text-muted-foreground" role="status">
+          {m.status === "incomplete" ? "Interrupted on another computer" : "Processing on another computer"}
+        </span>
+      ) : m.status === "incomplete" ? (
         <Button size="sm" variant="outline" onClick={() => act(() => recorder.recover(m.id))} disabled={busy}>
           {busy ? "Recovering…" : "Recover"}
         </Button>
