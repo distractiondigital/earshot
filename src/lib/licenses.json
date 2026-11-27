@@ -42,6 +42,13 @@
   "source": "Native"
  },
  {
+  "name": "LAME MP3 encoder",
+  "version": "bundled with mp3lame-sys 0.2.0",
+  "license": "LGPL-2.0-or-later",
+  "url": "https://lame.sourceforge.io",
+  "source": "Native"
+ },
+ {
   "name": "utf8proc (in sherpa-onnx)",
   "version": "",
   "license": "MIT",
@@ -1404,6 +1411,20 @@
   "version": "0.8.1",
   "license": "BSD-3-Clause OR Apache-2.0",
   "url": "https://github.com/awxkee/moxcms",
+  "source": "Rust"
+ },
+ {
+  "name": "mp3lame-encoder",
+  "version": "0.3.0",
+  "license": "LGPL-3.0",
+  "url": "https://github.com/DoumanAsh/mp3lame-encoder",
+  "source": "Rust"
+ },
+ {
+  "name": "mp3lame-sys",
+  "version": "0.2.0",
+  "license": "LGPL-3.0",
+  "url": "https://github.com/DoumanAsh/mp3lame-sys",
   "source": "Rust"
  },
  {

@@ -678,10 +678,22 @@ pub async fn export_meeting(
     .await
 }
 
-/// Copies the meeting's audio tracks (FLAC) into a folder the user picks.
+/// Exports a meeting's audio. `kind`: "tracks" copies each track (lossless FLAC, as recorded)
+/// into a folder the user picks; "flac" or "mp3" mixes the tracks into one mono file.
 #[tauri::command]
-pub async fn export_audio(app: AppHandle, id: i64, date: String) -> Result<Option<String>, String> {
+pub async fn export_audio(
+    app: AppHandle,
+    id: i64,
+    kind: String,
+    date: String,
+) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+    let mix = match kind.as_str() {
+        "tracks" => None,
+        "flac" => Some(crate::mixdown::MixFormat::Flac),
+        "mp3" => Some(crate::mixdown::MixFormat::Mp3),
+        _ => return Err("unknown audio export".into()),
+    };
     blocking(move || {
         let db = app.state::<Db>();
         let meeting = db.meeting(id).map_err(err)?.ok_or("meeting not found")?;
@@ -689,21 +701,60 @@ pub async fn export_audio(app: AppHandle, id: i64, date: String) -> Result<Optio
         if tracks.is_empty() {
             return Err("This meeting has no audio.".into());
         }
-        let Some(dir) = app
-            .dialog()
-            .file()
-            .set_title("Export audio to folder")
-            .blocking_pick_folder()
-        else {
-            return Ok(None);
-        };
-        let dir = dir.into_path().map_err(err)?;
         let date: String = date
             .chars()
             .filter(|c| c.is_ascii_digit() || *c == '-')
             .take(10)
             .collect();
         let stem = crate::export::file_stem(&meeting, &date);
+
+        if let Some(format) = mix {
+            if app.state::<Recorder>().state().meeting_id == Some(id) {
+                return Err("Stop the recording before exporting a mix.".into());
+            }
+            let (label, ext) = match format {
+                crate::mixdown::MixFormat::Flac => ("FLAC audio", "flac"),
+                crate::mixdown::MixFormat::Mp3 => ("MP3 audio", "mp3"),
+            };
+            let Some(path) = app
+                .dialog()
+                .file()
+                .set_title("Export mixed audio")
+                .set_file_name(format!("{stem}.{ext}"))
+                .add_filter(label, &[ext])
+                .blocking_save_file()
+            else {
+                return Ok(None);
+            };
+            let path = path.into_path().map_err(err)?;
+            let _ = app.emit("audio-mix-started", id);
+            let paths: Vec<&std::path::Path> = tracks
+                .iter()
+                .map(|t| std::path::Path::new(&t.path))
+                .collect();
+            let title = if meeting.title.trim().is_empty() {
+                "Untitled meeting"
+            } else {
+                meeting.title.trim()
+            };
+            let started = std::time::Instant::now();
+            crate::mixdown::mix(&paths, &path, format, title)?;
+            log::info!(
+                "meeting {id}: exported a {ext} mix in {:.1} s",
+                started.elapsed().as_secs_f32()
+            );
+            return Ok(Some(path.display().to_string()));
+        }
+
+        let Some(dir) = app
+            .dialog()
+            .file()
+            .set_title("Export audio tracks to folder")
+            .blocking_pick_folder()
+        else {
+            return Ok(None);
+        };
+        let dir = dir.into_path().map_err(err)?;
         let me = me_name(&db);
         for t in tracks {
             let who = if t.kind == "mic" {

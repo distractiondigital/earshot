@@ -2,6 +2,7 @@ mod commands;
 mod db;
 mod export;
 mod hotkey;
+mod mixdown;
 mod models;
 mod pill;
 mod processing;

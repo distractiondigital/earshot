@@ -73,12 +73,18 @@ function exportDates(startedAt: number) {
   };
 }
 
+/** "tracks": each track as recorded (FLAC); "flac" / "mp3": one file with the tracks mixed. */
+export type AudioExport = "tracks" | "flac" | "mp3";
+
+/** Emitted with the meeting id once a mixed export starts writing (after the save dialog). */
+export const AUDIO_MIX_STARTED = "audio-mix-started";
+
 export const meeting = {
   search: (query: string) => invoke<SearchHit[]>("search_transcripts", { query }),
   exportTranscript: (id: number, format: ExportFormat, startedAt: number) =>
     invoke<string | null>("export_meeting", { id, format, ...exportDates(startedAt) }),
-  exportAudio: (id: number, startedAt: number) =>
-    invoke<string | null>("export_audio", { id, date: exportDates(startedAt).date }),
+  exportAudio: (id: number, kind: AudioExport, startedAt: number) =>
+    invoke<string | null>("export_audio", { id, kind, date: exportDates(startedAt).date }),
   remove: (id: number) => invoke<void>("delete_meeting", { id }),
   audio: (id: number) => invoke<TrackAudio[]>("meeting_audio", { id }),
   speakers: (id: number) => invoke<Speaker[]>("get_speakers", { id }),

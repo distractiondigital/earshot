@@ -34,7 +34,9 @@ every package that ships with the app, with its license text, is in
 | [cpal](https://github.com/RustAudio/cpal) | RustAudio contributors | Apache-2.0 | Microphone capture, and system audio on macOS. |
 | [wasapi-rs](https://github.com/HEnquist/wasapi-rs) | Henrik Enquist | MIT | System, device and per-app audio capture on Windows. |
 | [flacenc-rs](https://github.com/yotarok/flacenc-rs) | Yotaro Kubo | Apache-2.0 | Saves recordings as FLAC while they happen. |
-| [Symphonia](https://github.com/pdeljanov/Symphonia) | Philip Deljanov | MPL-2.0 | Reads recordings back for transcription. |
+| [Symphonia](https://github.com/pdeljanov/Symphonia) | Philip Deljanov | MPL-2.0 | Reads recordings back for transcription and export. |
+| [LAME](https://lame.sourceforge.io) | The LAME project | LGPL-2.0-or-later | Encodes MP3 exports. |
+| [mp3lame-encoder](https://github.com/DoumanAsh/mp3lame-encoder) | Douman | LGPL-3.0 |  |
 | [rubato](https://github.com/HEnquist/rubato) | Henrik Enquist | MIT / Apache-2.0 |  |
 | [rtrb](https://github.com/mgeier/rtrb) | Stjepan Glavina and Matthias Geier | MIT / Apache-2.0 |  |
 

@@ -25,6 +25,11 @@ log.workspace = true
 cpal = "=0.18.2"
 rtrb = "=0.4.1"
 flacenc = { version = "=0.5.1", default-features = false }
+# Audio export: decoding the tracks, matching sample rates, MP3 (LAME)
+symphonia = { version = "=0.6.1", default-features = false, features = ["flac"] }
+rubato = { version = "=5.1.0", default-features = false, features = ["fft_resampler"] }
+audioadapter-buffers = "=5.2.0"
+mp3lame-encoder = "=0.3.0"
 # Model manager and transcription jobs
 earshot-protocol = { path = "../crates/earshot-protocol" }
 reqwest = { version = "=0.13.5", default-features = false, features = ["stream", "rustls", "http2"] }
@@ -41,9 +46,6 @@ tauri-plugin-single-instance = "=2.5.5"
 tauri-plugin-opener = "=2.7.3"
 tauri-plugin-dialog = "=2.8.4"
 tauri-plugin-log = "=2.10.2"
-
-[dev-dependencies]
-symphonia = { version = "=0.6.1", default-features = false, features = ["flac"] }
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "=0.27.0"

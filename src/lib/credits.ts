@@ -133,7 +133,20 @@ export const credits: CreditGroup[] = [
         by: "Philip Deljanov",
         license: "MPL-2.0",
         url: "https://github.com/pdeljanov/Symphonia",
-        note: "Reads recordings back for transcription.",
+        note: "Reads recordings back for transcription and export.",
+      },
+      {
+        name: "LAME",
+        by: "The LAME project",
+        license: "LGPL-2.0-or-later",
+        url: "https://lame.sourceforge.io",
+        note: "Encodes MP3 exports.",
+      },
+      {
+        name: "mp3lame-encoder",
+        by: "Douman",
+        license: "LGPL-3.0",
+        url: "https://github.com/DoumanAsh/mp3lame-encoder",
       },
       {
         name: "rubato",

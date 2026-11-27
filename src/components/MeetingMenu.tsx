@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { MoreHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -12,7 +13,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { meeting as api, type ExportFormat } from "@/lib/meeting";
+import { AUDIO_MIX_STARTED, meeting as api, type AudioExport, type ExportFormat } from "@/lib/meeting";
 import type { Meeting } from "@/lib/recorder";
 
 const FORMATS: [ExportFormat, string][] = [
@@ -21,6 +22,12 @@ const FORMATS: [ExportFormat, string][] = [
   ["srt", "Subtitles (.srt)"],
   ["vtt", "Web subtitles (.vtt)"],
   ["json", "JSON with word timings (.json)"],
+];
+
+const AUDIO: [AudioExport, string, string][] = [
+  ["tracks", "Separate tracks (FLAC)", "Lossless, one file per track"],
+  ["flac", "Mixed (FLAC)", "Lossless, one file"],
+  ["mp3", "Mixed (MP3)", "Smaller, plays anywhere"],
 ];
 
 /** Export and delete for one meeting. */
@@ -70,17 +77,31 @@ export function MeetingMenu({
               ))}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
-          <DropdownMenuItem
-            disabled={!hasAudio}
-            onSelect={() =>
-              api
-                .exportAudio(m.id, m.startedAt)
-                .then(saved)
-                .catch((e) => onError(String(e)))
-            }
-          >
-            Export audio…
-          </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger disabled={!hasAudio}>Export audio</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent>
+              {AUDIO.map(([kind, label, hint]) => (
+                <DropdownMenuItem
+                  key={kind}
+                  className="flex-col items-start gap-0"
+                  onSelect={async () => {
+                    // A mix takes a moment for a long meeting: say so once the file is chosen.
+                    const unlisten = await listen<number>(AUDIO_MIX_STARTED, (e) => {
+                      if (e.payload === m.id) onDone("Mixing audio…");
+                    });
+                    api
+                      .exportAudio(m.id, kind, m.startedAt)
+                      .then(saved)
+                      .catch((e) => onError(String(e)))
+                      .finally(unlisten);
+                  }}
+                >
+                  <span>{label}</span>
+                  <span className="text-xs text-muted-foreground">{hint}</span>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" onSelect={() => setConfirm(true)}>
             Delete meeting…

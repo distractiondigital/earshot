@@ -84,6 +84,18 @@
     ]
   },
   {
+    "name": "LAME MP3 encoder",
+    "version": "bundled with mp3lame-sys 0.2.0",
+    "license": "LGPL-2.0-or-later",
+    "url": "https://lame.sourceforge.io",
+    "source": "Native",
+    "textFromCrate": [
+      "mp3lame-sys",
+      "0.2.0",
+      "lame-4.0"
+    ]
+  },
+  {
     "name": "utf8proc (in sherpa-onnx)",
     "license": "MIT",
     "url": "https://github.com/JuliaStrings/utf8proc",
