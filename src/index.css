@@ -134,3 +134,19 @@ html.pill body {
   background: transparent;
   overflow: hidden;
 }
+
+/* The pill's "no sound" row: a slow amber glow so it catches the eye during a call. */
+@keyframes alert-glow {
+  0%,
+  100% {
+    background-color: color-mix(in oklab, var(--background) 95%, transparent);
+  }
+  50% {
+    background-color: color-mix(in oklab, var(--color-amber-400) 55%, var(--background));
+  }
+}
+/* A colour fade, not movement, so it runs even with reduced motion: an alert that stayed still would
+   be easy to miss, which is the point of it. */
+.alert-glow {
+  animation: alert-glow 2.4s ease-in-out infinite;
+}

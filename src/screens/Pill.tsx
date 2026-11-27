@@ -69,7 +69,7 @@ export function Pill() {
     {alert && (
       <div
         role="alert"
-        className="flex h-8 w-full items-center gap-2 rounded-full border border-amber-500/40 bg-background/95 pr-1 pl-3 text-xs text-foreground shadow-sm select-none"
+        className="alert-glow flex h-8 w-full items-center gap-2 rounded-full border border-amber-500/60 pr-1 pl-3 text-xs text-foreground shadow-sm select-none"
       >
         <MicOff aria-hidden className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
         <span data-tauri-drag-region className="flex-1 truncate">
