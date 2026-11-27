@@ -58,7 +58,7 @@ export function MeetingMenu({
             <MoreHorizontal aria-hidden />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
+        <DropdownMenuContent align="end" className="w-auto">
           <DropdownMenuSub>
             <DropdownMenuSubTrigger disabled={!hasTranscript}>Export transcript</DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
