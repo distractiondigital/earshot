@@ -21,7 +21,7 @@ It works with any call app (Zoom, Teams, Meet, Discord, a phone on speaker) beca
 
 ## Features
 
-- **Recording:** your mic and the meeting audio as two tracks, from all system audio or a single app (Windows). A small floating recorder shows levels, and a global shortcut starts and stops recording from any app. Recordings are written safely as they happen: if the app or computer crashes, everything up to that moment is kept and you can carry on where you left off.
+- **Recording:** your mic and the meeting audio as two tracks, from all system audio or a single app (Windows). A small floating recorder shows levels and warns you if the mic or meeting stays silent, and you can switch either source mid-recording without a break. A global shortcut starts and stops recording from any app. Recordings are written safely as they happen: if the app or computer crashes, everything up to that moment is kept and you can carry on where you left off.
 - **Transcription:** OpenAI's Whisper models, from Tiny to Large V3, with a recommendation for your hardware. Word-level timing, many languages, and GPU acceleration (NVIDIA, AMD, Intel or Apple) with an automatic fallback to the processor.
 - **Speakers:** everything from your mic is you; the meeting audio is split into its separate voices. Rename, merge and reassign speakers, and save a voice so Earshot suggests that person's name in future meetings.
 - **Review:** an audio player synced to the transcript. Click any word to hear it, correct the text in place, and mute either track. Search across every meeting, and export transcripts to Markdown, text, SRT, VTT or JSON, and audio as separate lossless tracks or a single mix (FLAC or MP3).

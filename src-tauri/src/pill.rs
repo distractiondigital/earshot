@@ -55,3 +55,14 @@ pub fn hide(app: &AppHandle) {
         let _ = w.destroy();
     }
 }
+
+/// Height of the pill while it shows a "no sound" alert under the meters.
+const ALERT_HEIGHT: f64 = 84.0;
+
+/// Grows the pill to show the silence alert, or shrinks it back.
+pub fn set_alert(app: &AppHandle, on: bool) {
+    if let Some(w) = app.get_webview_window(LABEL) {
+        let height = if on { ALERT_HEIGHT } else { HEIGHT };
+        let _ = w.set_size(tauri::LogicalSize::new(WIDTH, height));
+    }
+}

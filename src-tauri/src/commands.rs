@@ -190,6 +190,36 @@ pub async fn stop_recording(app: AppHandle) -> Result<i64, String> {
     blocking(move || app.state::<Recorder>().stop(&app)).await
 }
 
+/// Brings the main window forward on the recording card (from the pill's alert).
+#[tauri::command]
+pub fn show_recorder(app: AppHandle) {
+    crate::tray::show_main_window(&app);
+    let _ = app.emit("recorder://show", ());
+}
+
+/// Switches a source while recording: `kind` "mic" (with `micDevice`, empty or null for the
+/// system default) or "system" (with `system`).
+#[tauri::command]
+pub async fn switch_recording_source(
+    app: AppHandle,
+    kind: String,
+    mic_device: Option<String>,
+    system: Option<crate::recorder::capture::SystemSource>,
+) -> Result<RecorderState, String> {
+    blocking(move || {
+        let recorder = app.state::<Recorder>();
+        match kind.as_str() {
+            "mic" => recorder.switch_source(&app, Some(mic_device), None),
+            "system" => {
+                let system = system.ok_or("No meeting audio source given.")?;
+                recorder.switch_source(&app, None, Some(system))
+            }
+            _ => Err("unknown source".into()),
+        }
+    })
+    .await
+}
+
 #[tauri::command]
 pub fn pause_recording(
     app: AppHandle,

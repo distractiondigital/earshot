@@ -16,7 +16,18 @@ export interface RecorderState {
   elapsedMs: number;
   micSource: string | null;
   systemSource: string | null;
+  /** The microphone being recorded (null = system default). */
+  micDevice: string | null;
+  /** The meeting-audio source being recorded. */
+  system: SystemSource | null;
   warnings: string[];
+  silence: Silence;
+}
+
+/** Tracks that have heard nothing in the 15 seconds since their source started. */
+export interface Silence {
+  mic: boolean;
+  system: boolean;
 }
 
 export interface Levels {
@@ -78,6 +89,14 @@ export const recorder = {
   resume: (id: number) => invoke<RecorderState>("resume_recording", { id }),
   interrupted: () => invoke<Interrupted | null>("interrupted_meeting"),
   pause: (paused: boolean) => invoke<RecorderState>("pause_recording", { paused }),
+  /** Switches the microphone while recording (null = system default). */
+  switchMic: (micDevice: string | null) =>
+    invoke<RecorderState>("switch_recording_source", { kind: "mic", micDevice }),
+  /** Switches the meeting audio while recording. */
+  switchSystem: (system: SystemSource) =>
+    invoke<RecorderState>("switch_recording_source", { kind: "system", system }),
+  /** Shows the main window on the recorder. */
+  showRecorder: () => invoke<void>("show_recorder"),
   sources: () => invoke<Sources>("list_sources"),
   meetings: () => invoke<Meeting[]>("list_meetings"),
   updateMeeting: (id: number, title: string, speakerHint: number | null, tags: string[]) =>
@@ -97,7 +116,10 @@ const IDLE: RecorderState = {
   elapsedMs: 0,
   micSource: null,
   systemSource: null,
+  micDevice: null,
+  system: null,
   warnings: [],
+  silence: { mic: false, system: false },
 };
 
 /** Live recorder state, kept in sync with backend events. */
@@ -113,6 +135,31 @@ export function useRecorderState() {
     };
   }, []);
   return state;
+}
+
+/** Which tracks are silent, kept in sync with backend events. */
+export function useSilence() {
+  const [silence, setSilence] = useState<Silence>(IDLE.silence);
+  useEffect(() => {
+    let alive = true;
+    recorder.state().then((s) => alive && setSilence(s.silence));
+    const un = listen<Silence>("recorder://silence", (e) => setSilence(e.payload));
+    const unState = listen<RecorderState>("recorder://state", (e) => setSilence(e.payload.silence));
+    return () => {
+      alive = false;
+      un.then((f) => f());
+      unState.then((f) => f());
+    };
+  }, []);
+  return silence;
+}
+
+/** What to tell the user about silent tracks, or null. `short` fits the floating pill. */
+export function silenceMessage(s: Silence, short = false): string | null {
+  if (s.mic && s.system) return short ? "Mic and meeting silent" : "No sound from your mic or the meeting yet";
+  if (s.mic) return short ? "Mic is silent" : "No sound from your mic yet";
+  if (s.system) return short ? "Meeting is silent" : "No sound from the meeting yet";
+  return null;
 }
 
 /** Live level meters (~15 Hz while recording). */

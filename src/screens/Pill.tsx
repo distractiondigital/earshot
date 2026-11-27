@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
-import { Pause, Play, Square } from "lucide-react";
+import { MicOff, Pause, Play, Square } from "lucide-react";
 import { cn } from "cn";
 import { ipc } from "@/lib/ipc";
-import { formatElapsed, recorder, useLevels, useRecorderState } from "@/lib/recorder";
+import { formatElapsed, recorder, silenceMessage, useLevels, useRecorderState, useSilence } from "@/lib/recorder";
 
 /** Floating recorder: red dot, elapsed time, Mic/Meeting meters, pause, stop. Nothing else. */
 export function Pill() {
@@ -11,6 +11,8 @@ export function Pill() {
   const [reminder, setReminder] = useState(false);
   const paused = state.status === "paused";
   const elapsed = levels?.elapsedMs ?? state.elapsedMs;
+  // The window grows (natively) to fit this row while a track is silent.
+  const alert = silenceMessage(useSilence(), true);
 
   useEffect(() => {
     document.documentElement.classList.add("pill");
@@ -23,6 +25,7 @@ export function Pill() {
   }, []);
 
   return (
+    <div data-tauri-drag-region className="flex w-full flex-col gap-1.5">
     <div
       data-tauri-drag-region
       className="flex h-11 w-full items-center gap-2.5 rounded-full border border-border bg-background/95 pr-1.5 pl-3.5 text-foreground shadow-sm select-none"
@@ -62,6 +65,25 @@ export function Pill() {
       >
         <Square className="size-3.5 fill-current" />
       </button>
+    </div>
+    {alert && (
+      <div
+        role="alert"
+        className="flex h-8 w-full items-center gap-2 rounded-full border border-amber-500/40 bg-background/95 pr-1 pl-3 text-xs text-foreground shadow-sm select-none"
+      >
+        <MicOff aria-hidden className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+        <span data-tauri-drag-region className="flex-1 truncate">
+          {alert}
+        </span>
+        <button
+          type="button"
+          onClick={() => recorder.showRecorder()}
+          className="rounded-full px-2.5 py-1 font-medium outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          Change
+        </button>
+      </div>
+    )}
     </div>
   );
 }

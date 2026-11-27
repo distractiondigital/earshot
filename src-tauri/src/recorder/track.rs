@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler};
+
 use super::flac::FlacWriter;
 
 /// How often the writer wakes up to drain the ring buffer.
@@ -116,6 +119,142 @@ fn meter_value(rms: f32) -> f32 {
     ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
+/// Turns captured samples (any channel count, any rate) into the track file's format.
+struct Converter {
+    in_ch: usize,
+    out_ch: usize,
+    resample: Option<Resample>,
+}
+
+/// Rate conversion for a source that runs at a different rate from the file (a device switched
+/// to mid-meeting, e.g. a Bluetooth headset at 16 kHz on a 48 kHz track).
+struct Resample {
+    resampler: Fft<f32>,
+    /// Remixed input frames waiting for a full resampler chunk (interleaved, file channels).
+    pending: Vec<f32>,
+    output: Vec<f32>,
+    /// Leading output frames still to drop (the resampler's delay), so audio stays in time.
+    skip: usize,
+}
+
+impl Converter {
+    fn new(in_ch: usize, in_rate: u32, out_ch: usize, out_rate: u32) -> Self {
+        let resample = (in_rate != out_rate)
+            .then(|| {
+                Fft::<f32>::new(
+                    in_rate as usize,
+                    out_rate as usize,
+                    1024,
+                    out_ch,
+                    FixedSync::Input,
+                )
+                .map_err(|e| log::error!("can't resample {in_rate} Hz to {out_rate} Hz: {e}"))
+                .ok()
+            })
+            .flatten()
+            .map(|resampler| Resample {
+                skip: resampler.output_delay(),
+                output: vec![0.0; resampler.output_frames_max() * out_ch],
+                pending: Vec::new(),
+                resampler,
+            });
+        Self {
+            in_ch: in_ch.max(1),
+            out_ch,
+            resample,
+        }
+    }
+
+    /// Appends `input` (interleaved, `in_ch` channels) to `out` in the file's format.
+    fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let (in_ch, out_ch) = (self.in_ch, self.out_ch);
+        let frames = input.chunks_exact(in_ch);
+        let Some(rs) = self.resample.as_mut() else {
+            for frame in frames {
+                out.extend((0..out_ch).map(|o| remix(frame, o, out_ch)));
+            }
+            return;
+        };
+        for frame in frames {
+            rs.pending
+                .extend((0..out_ch).map(|o| remix(frame, o, out_ch)));
+        }
+        loop {
+            let need = rs.resampler.input_frames_next();
+            if rs.pending.len() < need * out_ch {
+                break;
+            }
+            let len = rs.output.len() / out_ch;
+            let result = InterleavedSlice::new(&rs.pending[..need * out_ch], out_ch, need)
+                .map_err(|e| e.to_string())
+                .and_then(|inp| {
+                    let mut outp = InterleavedSlice::new_mut(&mut rs.output, out_ch, len)
+                        .map_err(|e| e.to_string())?;
+                    rs.resampler
+                        .process_into_buffer(&inp, &mut outp, None)
+                        .map_err(|e| e.to_string())
+                });
+            let produced = match result {
+                Ok((_, produced)) => produced,
+                Err(e) => {
+                    log::error!("resampling failed: {e}");
+                    rs.pending.clear();
+                    break;
+                }
+            };
+            rs.pending.drain(..need * out_ch);
+            let skipped = rs.skip.min(produced);
+            rs.skip -= skipped;
+            out.extend_from_slice(&rs.output[skipped * out_ch..produced * out_ch]);
+        }
+    }
+}
+
+/// Where a writer reads its samples from. Replaced when the device is switched mid-meeting.
+struct Input {
+    consumer: rtrb::Consumer<f32>,
+    converter: Converter,
+    buf: Vec<f32>,
+}
+
+impl Input {
+    fn new(
+        consumer: rtrb::Consumer<f32>,
+        channels: u16,
+        rate: u32,
+        out_ch: usize,
+        out_rate: u32,
+    ) -> Self {
+        Self {
+            consumer,
+            converter: Converter::new(usize::from(channels), rate, out_ch, out_rate),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Moves everything buffered (whole frames only) into `out`, in the file's format.
+    fn drain(&mut self, out: &mut Vec<f32>) {
+        let in_ch = self.converter.in_ch;
+        let available = self.consumer.slots() - self.consumer.slots() % in_ch;
+        if available == 0 {
+            return;
+        }
+        let chunk = self
+            .consumer
+            .read_chunk(available)
+            .expect("slots were counted");
+        let (a, b) = chunk.as_slices();
+        self.buf.clear();
+        self.buf.extend_from_slice(a);
+        self.buf.extend_from_slice(b);
+        chunk.commit_all();
+        self.converter.push(&self.buf, out);
+    }
+}
+
+/// A new source (consumer, channels, sample rate) waiting to be picked up by the writer thread.
+type PendingInput = Arc<Mutex<Option<(rtrb::Consumer<f32>, u16, u32)>>>;
+
 pub struct TrackStats {
     pub frames: u64,
     pub sample_rate: u32,
@@ -128,6 +267,8 @@ pub struct TrackWriter {
     /// Samples dropped because the ring buffer was full (writer too slow).
     pub overflow: Arc<AtomicU64>,
     pub sample_rate: u32,
+    pub channels: u16,
+    next_input: PendingInput,
 }
 
 impl TrackWriter {
@@ -138,52 +279,51 @@ impl TrackWriter {
         name: &str,
         mut flac: FlacWriter,
         in_channels: u16,
-        mut consumer: rtrb::Consumer<f32>,
+        consumer: rtrb::Consumer<f32>,
         overflow: Arc<AtomicU64>,
         clock: Arc<Clock>,
     ) -> io::Result<Self> {
         let sample_rate = flac.sample_rate();
+        let channels = flac.channels();
         let stop = Arc::new(AtomicBool::new(false));
         let level = Arc::new(Level::default());
-        let (stop_t, level_t) = (stop.clone(), level.clone());
-        let ch = usize::from(flac.channels());
-        let in_ch = usize::from(in_channels.max(1));
+        let next_input: PendingInput = Arc::default();
+        let (stop_t, level_t, next_t) = (stop.clone(), level.clone(), next_input.clone());
+        let ch = usize::from(channels);
         let rate = f64::from(sample_rate);
+        let mut input = Input::new(consumer, in_channels, sample_rate, ch, sample_rate);
 
         let join = std::thread::Builder::new()
             .name(format!("earshot-writer-{name}"))
             .spawn(move || -> io::Result<u64> {
+                let mut samples: Vec<f32> = Vec::with_capacity(sample_rate as usize * ch);
                 let mut scratch: Vec<i32> = Vec::with_capacity(sample_rate as usize * ch);
-                let mut input: Vec<f32> = Vec::with_capacity(sample_rate as usize * in_ch);
                 let mut last_flush = Instant::now();
                 let mut last_sync = Instant::now();
                 loop {
                     let stopping = stop_t.load(Ordering::Acquire);
                     let paused = clock.is_paused();
 
-                    // Drain everything currently buffered (whole input frames only).
-                    let available = consumer.slots() - consumer.slots() % in_ch;
+                    // Drain everything currently buffered; on a device switch, finish the old
+                    // source (already stopped) and carry on from the new one.
+                    samples.clear();
+                    input.drain(&mut samples);
+                    let next = next_t.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some((consumer, in_ch, in_rate)) = next {
+                        input.drain(&mut samples);
+                        input = Input::new(consumer, in_ch, in_rate, ch, sample_rate);
+                        input.drain(&mut samples);
+                    }
                     scratch.clear();
                     let mut sum_sq = 0.0f32;
-                    if available > 0 {
-                        let chunk = consumer.read_chunk(available).expect("slots were counted");
-                        let (a, b) = chunk.as_slices();
-                        input.clear();
-                        input.extend_from_slice(a);
-                        input.extend_from_slice(b);
-                        chunk.commit_all();
-                        for frame in input.chunks_exact(in_ch) {
-                            for o in 0..ch {
-                                let s = remix(frame, o, ch);
-                                let s = if s.is_finite() {
-                                    s.clamp(-1.0, 1.0)
-                                } else {
-                                    0.0
-                                };
-                                sum_sq += s * s;
-                                scratch.push((s * 32767.0).round() as i32);
-                            }
-                        }
+                    for &s in &samples {
+                        let s = if s.is_finite() {
+                            s.clamp(-1.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        sum_sq += s * s;
+                        scratch.push((s * 32767.0).round() as i32);
                     }
                     let rms = if scratch.is_empty() {
                         0.0
@@ -224,7 +364,16 @@ impl TrackWriter {
             level,
             overflow,
             sample_rate,
+            channels,
+            next_input,
         })
+    }
+
+    /// Switches the writer to a new source (`channels` at `rate`), converted to the file's
+    /// format. Stop the old capture first: whatever it left in its buffer is still written.
+    pub fn replace_input(&self, consumer: rtrb::Consumer<f32>, channels: u16, rate: u32) {
+        *self.next_input.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((consumer, channels, rate));
     }
 
     /// Writes out everything still buffered, finalizes the file and returns its stats.
@@ -375,6 +524,61 @@ mod tests {
         assert!(
             secs <= after && secs >= before - SILENCE_SLACK.as_secs_f64() - 0.05,
             "{secs} not within {before}..{after}"
+        );
+    }
+
+    fn tone(rate: u32, channels: usize, secs: f32, hz: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize)
+            .flat_map(|i| {
+                let v = (i as f32 * hz * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                std::iter::repeat_n(v, channels)
+            })
+            .collect()
+    }
+
+    fn crossings(s: &[f32]) -> usize {
+        s.windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count()
+    }
+
+    #[test]
+    fn switching_source_mid_track_converts_to_the_file_format() {
+        // A 48 kHz mono track switches to a 16 kHz stereo device (a Bluetooth headset).
+        let path = temp_path("switch");
+        let (mut sink, consumer, overflow) = ring(48_000, 1, 2);
+        let clock = Arc::new(Clock::start());
+        let w = TrackWriter::spawn(
+            "test",
+            FlacWriter::create(&path, 48_000, 1).unwrap(),
+            1,
+            consumer,
+            overflow,
+            clock.clone(),
+        )
+        .unwrap();
+        sink.push(&tone(48_000, 1, 0.5, 440.0));
+        let (mut sink2, consumer2, _) = ring(16_000, 2, 2);
+        w.replace_input(consumer2, 2, 16_000);
+        sink2.push(&tone(16_000, 2, 0.5, 1_000.0));
+        std::thread::sleep(Duration::from_millis(1200));
+        let stats = w.finish().unwrap();
+        assert_eq!(stats.sample_rate, 48_000);
+
+        let (s, rate) = crate::mixdown::decode_mono(&path);
+        assert_eq!(rate, 48_000);
+        // Padded to the clock (less the writer's margin), so the switch left no gap or overlap.
+        assert!(s.len() >= 52_000, "{}", s.len());
+        let at = |a: f32, b: f32| &s[(a * 48_000.0) as usize..(b * 48_000.0) as usize];
+        // The first source at its own pitch, then the second at its own pitch (resampled, not
+        // played at the wrong speed), then silence padded to the clock.
+        let first = crossings(at(0.05, 0.45));
+        assert!((345..=360).contains(&first), "440 Hz section: {first}");
+        let second = crossings(at(0.55, 0.85));
+        assert!((590..=610).contains(&second), "1 kHz section: {second}");
+        assert!(
+            s[s.len() - 2_400..].iter().all(|v| v.abs() < 1e-3),
+            "padding is silent"
         );
     }
 

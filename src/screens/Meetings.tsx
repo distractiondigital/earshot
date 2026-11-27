@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, Circle, Headphones, Pause, Play, Search, Square, X } from "lucide-react";
+import { AlertTriangle, Circle, Headphones, MicOff, Pause, Play, Search, Square, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -19,8 +19,10 @@ import {
   formatElapsed,
   QUICK_CONTINUE_MS,
   recorder,
+  silenceMessage,
   useLevels,
   useRecorderState,
+  useSilence,
   type Interrupted,
   type Meeting,
   type Sources,
@@ -288,10 +290,35 @@ function RecordControls({
   );
 }
 
+/** Mic picker value for the system default device. */
+const DEFAULT_MIC = "__default__";
+
 function RecordingCard() {
   const state = useRecorderState();
   const levels = useLevels();
+  const alert = silenceMessage(useSilence());
   const paused = state.status === "paused";
+  const [sources, setSources] = useState<Sources | null>(null);
+  const [switching, setSwitching] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+  const loadSources = useCallback(() => {
+    recorder.sources().then(setSources).catch(() => {});
+  }, []);
+  useEffect(loadSources, [loadSources]);
+
+  const doSwitch = async (p: () => Promise<unknown>) => {
+    setSwitching(true);
+    setSwitchError(null);
+    try {
+      await p();
+    } catch (e) {
+      setSwitchError(String(e));
+    } finally {
+      setSwitching(false);
+    }
+  };
+  const mics = sources?.inputDevices ?? [];
+  const mic = state.micDevice ?? DEFAULT_MIC;
   return (
     <div className="mt-6 rounded-lg border border-border p-4">
       <div className="flex items-center gap-3">
@@ -311,12 +338,57 @@ function RecordingCard() {
           </Button>
         </div>
       </div>
-      <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
-        <dt className="text-muted-foreground">Mic</dt>
-        <dd>{state.micSource ?? "Not recorded"}</dd>
-        <dt className="text-muted-foreground">Meeting</dt>
-        <dd>{state.systemSource ?? "Not recorded"}</dd>
-      </dl>
+      {/* Either source can be changed mid-meeting; the track carries on with the new device. */}
+      <div className="mt-3 grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-2 text-sm">
+        <span className="text-muted-foreground">Mic</span>
+        <Select
+          value={mic}
+          disabled={switching}
+          onOpenChange={(o) => o && loadSources()}
+          onValueChange={(v) => doSwitch(() => recorder.switchMic(v === DEFAULT_MIC ? null : v))}
+        >
+          <SelectTrigger size="sm" className="w-80" aria-label="Microphone">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent position="popper">
+            <SelectItem value={DEFAULT_MIC}>System default</SelectItem>
+            {mic !== DEFAULT_MIC && !mics.some((d) => d.id === mic) && (
+              <SelectItem value={mic}>{state.micSource ?? "Previous microphone"}</SelectItem>
+            )}
+            {mics.map((d) => (
+              <SelectItem key={d.id} value={d.id}>
+                {d.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <span className="text-muted-foreground">Meeting</span>
+        {state.system ? (
+          <SourceSelect
+            value={state.system}
+            sources={sources}
+            onOpen={loadSources}
+            onChange={(v) => doSwitch(() => recorder.switchSystem(v))}
+            className="h-8 w-80"
+          />
+        ) : (
+          <span>{state.systemSource ?? "Not recorded"}</span>
+        )}
+      </div>
+      {alert && (
+        <div role="alert" className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm">
+          <MicOff aria-hidden className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <p>
+            {alert}. If it's muted or the wrong device, pick another above; the recording continues
+            without a break.
+          </p>
+        </div>
+      )}
+      {switchError && (
+        <p className="mt-3 text-sm text-destructive" role="alert">
+          {switchError}
+        </p>
+      )}
       {state.warnings.length > 0 && (
         <p className="mt-3 text-sm whitespace-pre-line text-destructive" role="alert">
           {state.warnings.join("\n")}

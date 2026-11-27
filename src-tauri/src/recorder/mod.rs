@@ -25,6 +25,8 @@ use track::{Clock, Level, TrackWriter};
 pub const EVENT_STATE: &str = "recorder://state";
 pub const EVENT_LEVELS: &str = "recorder://levels";
 pub const EVENT_STOPPED: &str = "recorder://stopped";
+/// Which tracks have heard nothing since they started: `Silence`.
+pub const EVENT_SILENCE: &str = "recorder://silence";
 
 /// Seconds of audio each ring buffer holds before samples are dropped.
 const RING_SECONDS: u32 = 10;
@@ -32,6 +34,11 @@ const LEVELS_INTERVAL: Duration = Duration::from_millis(66);
 /// The hotkey / tray continue an interrupted meeting instead of starting a new one within this
 /// time of the interruption.
 pub const QUICK_CONTINUE_WINDOW: Duration = Duration::from_secs(15 * 60);
+/// A track that stays below [`SILENT_LEVEL`] this long after its source started is reported as
+/// silent (muted or wrong device, or simply nobody talking yet).
+const SILENCE_ALERT_AFTER: Duration = Duration::from_secs(15);
+/// Meter value (0–1 over -60..0 dBFS) below which a track counts as silent: about -54 dBFS.
+const SILENT_LEVEL: f32 = 0.1;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,8 +59,29 @@ pub struct RecorderState {
     pub elapsed_ms: u64,
     pub mic_source: Option<String>,
     pub system_source: Option<String>,
+    /// The microphone being recorded (`None` = system default), for switching mid-meeting.
+    pub mic_device: Option<String>,
+    /// The meeting-audio source being recorded, for switching mid-meeting.
+    pub system: Option<SystemSource>,
     /// Sources that could not be opened (recording continues with the rest).
     pub warnings: Vec<String>,
+    pub silence: Silence,
+}
+
+/// Tracks that have stayed silent since their source started (see [`SILENCE_ALERT_AFTER`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Silence {
+    pub mic: bool,
+    pub system: bool,
+}
+
+/// Watches one track for silence after its source starts.
+#[derive(Debug, Default)]
+struct SilenceWatch {
+    /// Clock reading when the current source started.
+    since: Duration,
+    heard: bool,
+    alerted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +98,7 @@ struct LiveTrack {
     kind: &'static str,
     track_id: i64,
     label: String,
+    watch: Arc<Mutex<SilenceWatch>>,
     // Field order matters: the capture is dropped (stopped) before the writer is finished.
     capture: Option<Capture>,
     writer: TrackWriter,
@@ -78,6 +107,9 @@ struct LiveTrack {
 struct Session {
     meeting_id: i64,
     started_at: i64,
+    dir: PathBuf,
+    mic_device: Option<String>,
+    system: SystemSource,
     clock: Arc<Clock>,
     tracks: Vec<LiveTrack>,
     warnings: Vec<String>,
@@ -126,7 +158,10 @@ impl Recorder {
                 elapsed_ms: 0,
                 mic_source: None,
                 system_source: None,
+                mic_device: None,
+                system: None,
                 warnings: Vec::new(),
+                silence: Silence::default(),
             },
             Some(s) => RecorderState {
                 status: if s.clock.is_paused() {
@@ -145,9 +180,12 @@ impl Recorder {
                 system_source: s
                     .tracks
                     .iter()
-                    .find(|t| t.kind == "system")
+                    .find(|t| t.kind == "system" && t.capture.is_some())
                     .map(|t| t.label.clone()),
+                mic_device: s.mic_device.clone(),
+                system: Some(s.system.clone()),
                 warnings: s.warnings.clone(),
+                silence: silence_of(&s.tracks),
             },
         }
     }
@@ -176,20 +214,8 @@ impl Recorder {
                     .as_deref(),
             ),
         };
-        if let SystemSource::Input { id, name } = &system {
-            let mic_id = mic_device.clone().filter(|d| !d.is_empty()).or_else(|| {
-                capture::list_input_devices()
-                    .into_iter()
-                    .find(|d| d.is_default)
-                    .map(|d| d.id)
-            });
-            if mic_id.as_deref() == Some(id.as_str()) {
-                return Err(format!(
-                    "{name} is also your microphone. Pick a different meeting audio source or microphone."
-                ));
-            }
-        }
         let system_spec = serde_json::to_string(&system).ok();
+        check_not_same_device(mic_device.as_deref(), &system)?;
 
         let mut warnings = Vec::new();
         let mut prepared: Vec<(&'static str, Prepared)> = Vec::new();
@@ -235,6 +261,9 @@ impl Recorder {
         *guard = Some(Session {
             meeting_id,
             started_at,
+            dir,
+            mic_device: mic_device.filter(|d| !d.is_empty()),
+            system,
             clock,
             tracks,
             warnings,
@@ -363,7 +392,10 @@ impl Recorder {
             .flatten()
             .filter(|d| !d.is_empty());
         let mut tracks = Vec::new();
+        let mut system = SystemSource::None;
+        let mut dir = None;
         for (row, w) in opened {
+            dir = dir.or_else(|| Path::new(&row.path).parent().map(Path::to_path_buf));
             let kind: &'static str = if row.kind == "mic" { "mic" } else { "system" };
             let prepared = if kind == "mic" {
                 capture::prepare_mic_like(mic_device.as_deref(), w.sample_rate(), w.channels())
@@ -375,6 +407,7 @@ impl Recorder {
                     .map(Ok)
                     .unwrap_or_else(|| system_source_for(row.source.as_deref(), &mut warnings));
                 source.and_then(|s| {
+                    system = s.clone();
                     capture::prepare_system_like(&s, Some((w.sample_rate(), w.channels())))?
                         .ok_or_else(|| "no source".into())
                 })
@@ -413,6 +446,7 @@ impl Recorder {
                 kind,
                 track_id: row.id,
                 label,
+                watch: new_watch(&clock),
                 capture: Some(p.start(sink)),
                 writer,
             });
@@ -427,10 +461,17 @@ impl Recorder {
         db.set_meeting_status(meeting_id, "recording", None, None)
             .map_err(err)?;
 
+        let dir = match dir {
+            Some(d) => d,
+            None => recordings_dir(app)?.join(format!("meeting-{meeting_id}")),
+        };
         let (levels_stop, levels_join) = spawn_levels(app.clone(), clock.clone(), &tracks);
         *guard = Some(Session {
             meeting_id,
             started_at: meeting.started_at,
+            dir,
+            mic_device,
+            system,
             clock,
             tracks,
             warnings,
@@ -444,6 +485,105 @@ impl Recorder {
         );
         self.emit_state(app);
         crate::pill::show(app);
+        Ok(self.state())
+    }
+
+    /// Switches the mic (`mic` = device id, `None` for the system default) or the meeting
+    /// audio (`system`) while recording. The track carries on in the same file: the new source
+    /// is converted to the track's format and the moment of the switch is filled with silence.
+    /// A track that wasn't being recorded (no meeting audio, or a mic that failed) starts now,
+    /// padded with silence from the start of the meeting.
+    pub fn switch_source(
+        &self,
+        app: &AppHandle,
+        mic: Option<Option<String>>,
+        system: Option<SystemSource>,
+    ) -> Result<RecorderState, String> {
+        {
+            let mut guard = self.lock();
+            let s = guard.as_mut().ok_or("Not recording")?;
+            let db = app.state::<Db>();
+            let (kind, choice_mic, choice_system) = match (mic, system) {
+                (Some(m), None) => ("mic", m.filter(|d| !d.is_empty()), s.system.clone()),
+                (None, Some(sys)) => ("system", s.mic_device.clone(), sys),
+                _ => return Err("Choose one source to switch.".into()),
+            };
+            check_not_same_device(choice_mic.as_deref(), &choice_system)?;
+
+            let existing = s.tracks.iter().position(|t| t.kind == kind);
+            let like =
+                existing.map(|i| (s.tracks[i].writer.sample_rate, s.tracks[i].writer.channels));
+            let prepared = if kind == "mic" {
+                match like {
+                    Some((rate, ch)) => capture::prepare_mic_like(choice_mic.as_deref(), rate, ch),
+                    None => capture::prepare_mic(choice_mic.as_deref()),
+                }
+                .map(Some)
+            } else {
+                capture::prepare_system_like(&choice_system, like)
+            };
+            let prepared = prepared.map_err(|e| {
+                let what = if kind == "mic" {
+                    "Microphone"
+                } else {
+                    "Meeting audio"
+                };
+                format!("{what}: {e}")
+            })?;
+            let spec = (kind == "system")
+                .then(|| serde_json::to_string(&choice_system).ok())
+                .flatten();
+
+            match (existing, prepared) {
+                (Some(i), Some(p)) => {
+                    let t = &mut s.tracks[i];
+                    drop(t.capture.take()); // stop the old device; what it captured is still written
+                    let (sink, consumer, overflow) =
+                        track::ring(p.format.sample_rate, p.format.channels, RING_SECONDS);
+                    drop(overflow); // the writer keeps counting overflow of its first source only
+                    t.writer
+                        .replace_input(consumer, p.format.channels, p.format.sample_rate);
+                    t.label = p.label.clone();
+                    db.set_track_source(t.track_id, &t.label, spec.as_deref())
+                        .map_err(err)?;
+                    t.watch = new_watch(&s.clock);
+                    t.capture = Some(p.start(sink));
+                }
+                (Some(i), None) => {
+                    // Meeting audio turned off: the track continues as silence.
+                    let t = &mut s.tracks[i];
+                    drop(t.capture.take());
+                    t.watch = new_watch(&s.clock);
+                    db.set_track_source(t.track_id, "Not recorded", spec.as_deref())
+                        .map_err(err)?;
+                }
+                (None, Some(p)) => {
+                    let t = start_track(
+                        &db,
+                        s.meeting_id,
+                        kind,
+                        p,
+                        spec.as_deref(),
+                        &s.dir,
+                        s.clock.clone(),
+                    )?;
+                    s.tracks.push(t);
+                }
+                (None, None) => {}
+            }
+            s.mic_device = choice_mic;
+            s.system = choice_system;
+            // The meter thread holds each source's "device stopped" flag: restart it.
+            s.levels_stop.store(true, Ordering::Release);
+            if let Some(j) = s.levels_join.take() {
+                let _ = j.join();
+            }
+            let (stop, join) = spawn_levels(app.clone(), s.clock.clone(), &s.tracks);
+            s.levels_stop = stop;
+            s.levels_join = Some(join);
+            log::info!("recording: switched {kind} source");
+        }
+        self.emit_state(app);
         Ok(self.state())
     }
 
@@ -463,6 +603,101 @@ impl Recorder {
             log::error!("toggle recording failed: {e}");
             let _ = app.emit("recorder://error", e);
         }
+    }
+}
+
+/// Refuses to record one input device on both tracks.
+fn check_not_same_device(mic_device: Option<&str>, system: &SystemSource) -> Result<(), String> {
+    if let SystemSource::Input { id, name } = system {
+        let mic_id = mic_device
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                capture::list_input_devices()
+                    .into_iter()
+                    .find(|d| d.is_default)
+                    .map(|d| d.id)
+            });
+        if mic_id.as_deref() == Some(id.as_str()) {
+            return Err(format!(
+                "{name} is also your microphone. Pick a different meeting audio source or microphone."
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn new_watch(clock: &Clock) -> Arc<Mutex<SilenceWatch>> {
+    Arc::new(Mutex::new(SilenceWatch {
+        since: clock.elapsed(),
+        ..SilenceWatch::default()
+    }))
+}
+
+fn silence_of(tracks: &[LiveTrack]) -> Silence {
+    let alerted = |kind: &str| {
+        tracks.iter().any(|t| {
+            t.kind == kind
+                && t.capture.is_some()
+                && t.watch.lock().unwrap_or_else(|e| e.into_inner()).alerted
+        })
+    };
+    Silence {
+        mic: alerted("mic"),
+        system: alerted("system"),
+    }
+}
+
+/// Updates a track's silence watch with its current meter value; true when the alert changes.
+fn update_watch(w: &mut SilenceWatch, level: f32, now: Duration) -> bool {
+    if level >= SILENT_LEVEL {
+        w.heard = true;
+        return std::mem::take(&mut w.alerted);
+    }
+    if !w.heard && !w.alerted && now.saturating_sub(w.since) >= SILENCE_ALERT_AFTER {
+        w.alerted = true;
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn alerts_after_fifteen_quiet_seconds_and_clears_on_sound() {
+        let mut w = SilenceWatch {
+            since: 10 * S,
+            ..Default::default()
+        };
+        assert!(!update_watch(&mut w, 0.0, 20 * S));
+        assert!(
+            !update_watch(&mut w, 0.05, 24 * S),
+            "faint noise is still silence"
+        );
+        assert!(
+            update_watch(&mut w, 0.0, 25 * S),
+            "15 s after the source started"
+        );
+        assert!(w.alerted);
+        assert!(!update_watch(&mut w, 0.0, 40 * S), "alerts once");
+        assert!(update_watch(&mut w, 0.4, 41 * S), "sound clears the alert");
+        assert!(!w.alerted);
+        assert!(
+            !update_watch(&mut w, 0.0, 90 * S),
+            "once heard, quiet is normal"
+        );
+    }
+
+    #[test]
+    fn sound_early_on_means_no_alert() {
+        let mut w = SilenceWatch::default();
+        assert!(!update_watch(&mut w, 0.3, 2 * S));
+        assert!(!update_watch(&mut w, 0.0, 30 * S));
+        assert!(!w.alerted);
     }
 }
 
@@ -561,8 +796,8 @@ fn start_track(
     let label = p.label.clone();
     let (sink, consumer, overflow) = track::ring(fmt.sample_rate, fmt.channels, RING_SECONDS);
     let flac = flac::FlacWriter::create(&path, fmt.sample_rate, fmt.channels).map_err(err)?;
-    let writer =
-        TrackWriter::spawn(kind, flac, fmt.channels, consumer, overflow, clock).map_err(err)?;
+    let writer = TrackWriter::spawn(kind, flac, fmt.channels, consumer, overflow, clock.clone())
+        .map_err(err)?;
     let track_id = db
         .add_track(
             meeting_id,
@@ -574,11 +809,13 @@ fn start_track(
             spec,
         )
         .map_err(err)?;
+    let watch = new_watch(&clock);
     let capture = p.start(sink);
     Ok(LiveTrack {
         kind,
         track_id,
         label,
+        watch,
         capture: Some(capture),
         writer,
     })
@@ -590,33 +827,69 @@ fn spawn_levels(
     tracks: &[LiveTrack],
 ) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
-    let find = |kind: &str| -> Option<(Arc<Level>, Arc<AtomicBool>)> {
-        tracks.iter().find(|t| t.kind == kind).map(|t| {
-            (
-                t.writer.level.clone(),
-                t.capture
-                    .as_ref()
-                    .map(|c| c.failed.clone())
-                    .unwrap_or_default(),
-            )
-        })
+    type Watched = (Arc<Level>, Arc<AtomicBool>, Arc<Mutex<SilenceWatch>>);
+    // A track with no source (meeting audio turned off) has no meter and is not watched.
+    let find = |kind: &str| -> Option<Watched> {
+        tracks
+            .iter()
+            .find(|t| t.kind == kind && t.capture.is_some())
+            .map(|t| {
+                (
+                    t.writer.level.clone(),
+                    t.capture
+                        .as_ref()
+                        .map(|c| c.failed.clone())
+                        .unwrap_or_default(),
+                    t.watch.clone(),
+                )
+            })
     };
     let (mic, system) = (find("mic"), find("system"));
     let stop_t = stop.clone();
     let join = std::thread::Builder::new()
         .name("earshot-levels".into())
         .spawn(move || {
+            let watched = |t: &Option<Watched>| {
+                t.as_ref()
+                    .is_some_and(|(_, _, w)| w.lock().unwrap_or_else(|e| e.into_inner()).alerted)
+            };
+            // A watch may already be alerted (the meter thread restarts on every switch).
+            let initial = Silence {
+                mic: watched(&mic),
+                system: watched(&system),
+            };
+            let mut silence = initial;
+            crate::pill::set_alert(&app, silence.mic || silence.system);
             while !stop_t.load(Ordering::Acquire) {
+                let now = clock.elapsed();
                 let levels = Levels {
-                    mic: mic.as_ref().map(|(l, _)| l.get()),
-                    system: system.as_ref().map(|(l, _)| l.get()),
-                    elapsed_ms: clock.elapsed().as_millis() as u64,
-                    mic_failed: mic.as_ref().is_some_and(|(_, f)| f.load(Ordering::Relaxed)),
+                    mic: mic.as_ref().map(|(l, _, _)| l.get()),
+                    system: system.as_ref().map(|(l, _, _)| l.get()),
+                    elapsed_ms: now.as_millis() as u64,
+                    mic_failed: mic
+                        .as_ref()
+                        .is_some_and(|(_, f, _)| f.load(Ordering::Relaxed)),
                     system_failed: system
                         .as_ref()
-                        .is_some_and(|(_, f)| f.load(Ordering::Relaxed)),
+                        .is_some_and(|(_, f, _)| f.load(Ordering::Relaxed)),
                 };
                 let _ = app.emit(EVENT_LEVELS, &levels);
+                if !clock.is_paused() {
+                    let mut changed = false;
+                    for (t, flag) in [(&mic, &mut silence.mic), (&system, &mut silence.system)] {
+                        if let Some((level, _, watch)) = t {
+                            let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                            if update_watch(&mut w, level.get(), now) {
+                                *flag = w.alerted;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        crate::pill::set_alert(&app, silence.mic || silence.system);
+                        let _ = app.emit(EVENT_SILENCE, silence);
+                    }
+                }
                 std::thread::sleep(LEVELS_INTERVAL);
             }
         })

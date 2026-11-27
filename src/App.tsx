@@ -1,4 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { AudioLines, Settings as SettingsIcon, Users } from "lucide-react";
 import { cn } from "cn";
 import icon from "@/assets/icon.png";
@@ -31,6 +32,17 @@ export default function App() {
     setOpenMeeting(null);
     if (s === "settings") setSettingsTab("general");
   };
+
+  // The pill's "no sound" alert brings the main window up on the recorder.
+  useEffect(() => {
+    const un = listen("recorder://show", () => {
+      setScreen("meetings");
+      setOpenMeeting(null);
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   // App-wide shortcuts (the recording hotkey is a global OS shortcut, handled natively).
   useEffect(() => {

@@ -404,6 +404,15 @@ pub fn mix(tracks: &[&Path], target: &Path, format: MixFormat, title: &str) -> R
     }
 }
 
+/// Decodes a FLAC file to mono samples and its rate (tests elsewhere in the crate).
+#[cfg(test)]
+pub(crate) fn decode_mono(path: &Path) -> (Vec<f32>, u32) {
+    let mut t = Track::open(path).unwrap();
+    let mut out = Vec::new();
+    while t.pull(&mut out, BLOCK).unwrap() == BLOCK {}
+    (out, t.rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

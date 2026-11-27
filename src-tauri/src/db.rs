@@ -357,6 +357,20 @@ impl Db {
     }
 
     /// Marks a track as being written again (continuing an interrupted meeting).
+    /// Records the source a track switched to mid-meeting.
+    pub fn set_track_source(
+        &self,
+        track_id: i64,
+        source: &str,
+        source_spec: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.conn().execute(
+            "UPDATE tracks SET source = ?2, source_spec = ?3 WHERE id = ?1",
+            params![track_id, source, source_spec],
+        )?;
+        Ok(())
+    }
+
     pub fn reopen_track(&self, track_id: i64) -> Result<(), DbError> {
         self.conn()
             .execute("UPDATE tracks SET finalized = 0 WHERE id = ?1", [track_id])?;

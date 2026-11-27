@@ -100,6 +100,8 @@ pub fn run() {
             commands::resume_recording,
             commands::interrupted_meeting,
             commands::pause_recording,
+            commands::switch_recording_source,
+            commands::show_recorder,
             commands::list_sources,
             commands::list_meetings,
             commands::update_meeting,
