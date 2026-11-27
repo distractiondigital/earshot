@@ -1283,7 +1283,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "earshot"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "audioadapter-buffers",
  "chrono",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "earshot-llm"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "earshot-protocol",
  "llama-cpp-2",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "earshot-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "earshot-worker"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "audioadapter-buffers",
  "earshot-protocol",
