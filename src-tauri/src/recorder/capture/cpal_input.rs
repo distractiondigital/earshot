@@ -78,7 +78,10 @@ fn preferred_config(
     let fits = |r: &cpal::SupportedStreamConfigRange| {
         r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate()
     };
-    let default_format = device.default_input_config().ok().map(|c| c.sample_format());
+    let default_format = device
+        .default_input_config()
+        .ok()
+        .map(|c| c.sample_format());
     // Devices list every format they accept, 8-bit ones included: keep the device's own format,
     // else the most precise one, so asking for a rate never costs sample quality.
     let rank = |f: cpal::SampleFormat| {
