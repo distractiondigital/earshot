@@ -25,7 +25,13 @@ for (const key of ["windows-x86_64", "windows-x86_64-cuda", "darwin-aarch64", "d
 const version = tag.replace(/^v/, "");
 const { version: built } = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "src-tauri", "tauri.conf.json"), "utf8"));
 if (built !== version) throw new Error(`tag ${tag} does not match the app version ${built}`);
-const notes = `Earshot ${version}.`;
+// This version's entry in CHANGELOG.md ("## <version>" up to the next "## ").
+const changelog = readFileSync(join(import.meta.dirname, "..", "..", "CHANGELOG.md"), "utf8").replace(/\r\n/g, "\n");
+const section = changelog.split(/^## /m).find((s) => s.startsWith(`${version}\n`));
+if (!section) throw new Error(`CHANGELOG.md has no "## ${version}" entry`);
+const changes = section.slice(version.length).trim().replace(/^### /gm, "#### ");
+// The updater manifest gets the same text without Markdown headings.
+const notes = changes.replace(/^#### /gm, "").trim();
 writeFileSync(
   join(dir, "latest.json"),
   JSON.stringify({ version, notes, pub_date: new Date().toISOString(), platforms }, null, 2) + "\n",
@@ -44,7 +50,7 @@ const describe = (f) =>
           : "";
 writeFileSync(
   "release-notes.md",
-  `Download the installer for your computer:\n\n${files
+  `${changes}\n\n### Download\n\nInstall the one for your computer:\n\n${files
     .filter((f) => describe(f))
     .map((f) => `- **${f}**: ${describe(f)}`)
     .join("\n")}\n`,
