@@ -75,14 +75,31 @@ fn preferred_config(
     sample_rate: u32,
     channels: u16,
 ) -> Option<SupportedStreamConfig> {
-    let ranges: Vec<_> = device.supported_input_configs().ok()?.collect();
     let fits = |r: &cpal::SupportedStreamConfigRange| {
         r.min_sample_rate() <= sample_rate && sample_rate <= r.max_sample_rate()
     };
-    ranges
-        .iter()
-        .find(|r| r.channels() == channels && fits(r))
-        .or_else(|| ranges.iter().find(|r| fits(r)))
+    let default_format = device.default_input_config().ok().map(|c| c.sample_format());
+    // Devices list every format they accept, 8-bit ones included: keep the device's own format,
+    // else the most precise one, so asking for a rate never costs sample quality.
+    let rank = |f: cpal::SampleFormat| {
+        use cpal::SampleFormat as F;
+        if Some(f) == default_format {
+            return 0;
+        }
+        match f {
+            F::F32 => 1,
+            F::I32 => 2,
+            F::F64 => 3,
+            F::I16 => 4,
+            F::U16 => 5,
+            _ => 9,
+        }
+    };
+    device
+        .supported_input_configs()
+        .ok()?
+        .filter(fits)
+        .min_by_key(|r| (r.channels() != channels, rank(r.sample_format())))
         .map(|r| r.with_sample_rate(sample_rate))
 }
 
